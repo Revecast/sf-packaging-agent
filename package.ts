@@ -1704,6 +1704,23 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
   // Snapshot aliases before version create so we can find the new one
   const prevAliases = { ...(readProject(repo.path).packageAliases ?? {}) };
 
+  // Temporarily remove packageDirectories whose paths don't exist on disk —
+  // sf CLI validates all dirs even when only building one package
+  const currentProj   = readProject(repo.path);
+  const missingDirs   = currentProj.packageDirectories.filter(
+    d => d.path !== pkgDir.path && !fs.existsSync(path.join(repo.path, d.path))
+  );
+  let removedDirs = false;
+  if (missingDirs.length > 0) {
+    console.log(`\n  Temporarily removing ${missingDirs.length} packageDirectory entry(ies) whose source is not on this branch:`);
+    missingDirs.forEach(d => console.log(`    • ${d.path} (${d.package ?? "unregistered"})`));
+    currentProj.packageDirectories = currentProj.packageDirectories.filter(
+      d => !missingDirs.includes(d)
+    );
+    writeProject(repo.path, currentProj);
+    removedDirs = true;
+  }
+
   // Namespace injection — Managed only
   const backups = isUnlocked ? new Map<string, string>() : injectAll(sourceDir);
   if (backups.size > 0) console.log(`\n  ✓ Namespace injected into ${backups.size} file(s)`);
@@ -1770,6 +1787,14 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
     delete clean.namespace;
     writeProject(repo.path, clean);
     console.log("  ✓ Temporary namespace removed from sfdx-project.json");
+  }
+
+  // Restore any packageDirectories that were temporarily removed
+  if (removedDirs) {
+    const restored = readProject(repo.path);
+    restored.packageDirectories.push(...missingDirs);
+    writeProject(repo.path, restored);
+    console.log(`  ✓ Restored ${missingDirs.length} temporarily-removed packageDirectory entry(ies)`);
   }
 
   if (!success) return;
