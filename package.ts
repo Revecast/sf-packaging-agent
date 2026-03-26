@@ -2087,6 +2087,22 @@ async function main(): Promise<void> {
     }
   }
 
+  // Auto-pull latest changes before doing anything
+  console.log();
+  try {
+    const pullOut = run("git pull --ff-only", repo.path);
+    if (pullOut.includes("Already up to date") || pullOut.includes("up to date")) {
+      console.log(`  ✓ ${repo.name} is up to date`);
+    } else {
+      console.log(`  ✓ Pulled latest changes:`);
+      pullOut.split("\n").filter(Boolean).forEach(l => console.log(`    ${l}`));
+    }
+  } catch (err: any) {
+    // Non-fatal — warn but continue (e.g. detached HEAD, merge conflict, no remote)
+    console.log(`  ⚠️  git pull failed — continuing with local state`);
+    console.log(`     ${(err.message ?? "").split("\n")[0]}`);
+  }
+
   const allOrgs = listOrgs();
   if (allOrgs.length === 0) {
     console.log("\n  No authenticated orgs. Run: sf org login web --alias <alias>");
