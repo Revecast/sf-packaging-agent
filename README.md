@@ -70,8 +70,8 @@ Then an action menu:
 | Action | When to use |
 |--------|-------------|
 | **Register new package** | One-time, per sub-package. Runs `sf package create` and saves the `0Ho...` package ID to `sfdx-project.json`. Prompts for dependencies immediately after. |
-| **Create package version** | Each release cycle. Prompts for version bump (patch/minor/major), runs namespace injection, then `sf package version create --wait 60`. |
-| **Promote version to Released** | When a beta is ready for production. Irreversible. |
+| **Create package version** | Each release cycle. Prompts for version bump, runs namespace injection, runs `sf package version create --wait 60`, then generates release notes, install URLs, updates product README, and optionally auto-installs to your test org. |
+| **Promote version to Released** | When a beta is ready for production. Irreversible. Shows production install URL after. |
 | **Install version in org** | Test a beta in a scratch or sandbox org. |
 | **List all versions** | See all beta and released versions in the DevHub. |
 | **Manage dependencies** | Set which packages must be installed before this one (e.g. revecast-base before recruiter). |
@@ -93,6 +93,47 @@ Flows and prompt templates don't automatically pick up a namespace when a packag
 The `namespace: "Revecast"` field is also temporarily added to `sfdx-project.json` during packaging if not present, then removed.
 
 **Result:** repos stay namespace-free at all times, so they can be deployed directly to dev orgs without any special setup.
+
+---
+
+## Release management
+
+After every successful `Create package version`, the agent automatically:
+
+1. **Displays install URLs** for both sandbox and production:
+   ```
+   Sandbox:    https://test.salesforce.com/packaging/installPackage.apexp?p0=04t...
+   Production: https://login.salesforce.com/packaging/installPackage.apexp?p0=04t...
+   ```
+   And the CLI install command, ready to copy-paste.
+
+2. **Generates release notes** from two sources scoped to this package directory:
+   - Git commits to the package directory since the last version (using git tags it creates automatically)
+   - Feature entries from `docs/FEATURES.md` in the product repo (written by the AI dev agent each session)
+
+3. **Writes docs/RELEASES.md** in the product repo — newest version first, full history preserved.
+
+4. **Writes a standalone release file**: `docs/<PackageName>-v<version>.md` — useful for sharing with clients or attaching to a GitHub release.
+
+5. **Updates README.md** in the product repo with a `## Latest Package Versions` section showing the current version ID and install commands.
+
+6. **Git tags the product repo** as `pkg/<package-dir>/<version>` — used to scope commits to "since last release" for the next version's release notes.
+
+7. **Auto-installs to your test org** (if `testOrg` is set in repos.json), so you can verify the package installs cleanly immediately after creation.
+
+### Setting up auto-install testing
+
+Edit `repos.json` to add the org alias you want to test against:
+
+```json
+{
+  "name": "revecast-recruiter",
+  "path": "~/Documents/revecast-recruiter",
+  "testOrg": "orgfarmDev"
+}
+```
+
+After version create, the agent will prompt: `Auto-install to test org "orgfarmDev"? (Y/n)`. If it fails, you'll see the error immediately and can fix packaging issues before sharing the install URL.
 
 ---
 

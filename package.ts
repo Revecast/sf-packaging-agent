@@ -4,14 +4,6 @@
  * Usage:
  *   npm install        (first time only)
  *   npx tsx package.ts
- *
- * What it does:
- *   - Guides you through 2GP managed package creation, versioning, promoting,
- *     and installing — for any Revecast repo
- *   - Injects namespace (Revecast__) into flows and prompt templates at
- *     packaging time only; repos stay namespace-free for dev deploys
- *   - Auto-increments version numbers with a major/minor/patch prompt
- *   - Works with repos that already have packages and repos that don't yet
  */
 
 import * as readline from "readline";
@@ -19,22 +11,15 @@ import * as fs from "fs";
 import * as path from "path";
 import { execSync } from "child_process";
 
-// ─── Config ─────────────────────────────────────────────────────────────────────
+// ─── Config ──────────────────────────────────────────────────────────────────
 
 const NAMESPACE = "Revecast";
 const DEFAULT_INSTALL_KEY = "Jax123";
 
-// XML tags whose text content is a Salesforce object API name
-const FLOW_OBJECT_TAGS = [
-  "object", "targetObject", "lookupObject", "queryObject", "referencedObject",
-];
+const FLOW_OBJECT_TAGS = ["object", "targetObject", "lookupObject", "queryObject", "referencedObject"];
+const FLOW_FIELD_TAGS  = ["field", "targetField", "mapKey", "objectType"];
 
-// XML tags whose text content is a Salesforce field API name
-const FLOW_FIELD_TAGS = [
-  "field", "targetField", "mapKey", "objectType",
-];
-
-// ─── Types ───────────────────────────────────────────────────────────────────────
+// ─── Types ───────────────────────────────────────────────────────────────────
 
 interface OrgInfo {
   alias: string;
@@ -45,8 +30,8 @@ interface OrgInfo {
 }
 
 interface PackageDependency {
-  package: string;       // package alias (key in packageAliases)
-  versionNumber?: string; // e.g. "1.0.0.LATEST" or specific version
+  package: string;
+  versionNumber?: string;
 }
 
 interface PackageDir {
@@ -71,6 +56,7 @@ interface SfdxProject {
 interface RepoEntry {
   name: string;
   path: string;
+  testOrg?: string;
 }
 
 interface VersionParts {
@@ -79,7 +65,7 @@ interface VersionParts {
   patch: number;
 }
 
-// ─── I/O ────────────────────────────────────────────────────────────────────────
+// ─── I/O ─────────────────────────────────────────────────────────────────────
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -109,11 +95,11 @@ function banner(): void {
   console.log();
 }
 
-// ─── Org Detection ──────────────────────────────────────────────────────────────
+// ─── Org Detection ───────────────────────────────────────────────────────────
 
 function listOrgs(): OrgInfo[] {
   try {
-    const raw = run("sf org list --json");
+    const raw  = run("sf org list --json");
     const data = JSON.parse(raw);
     const orgs: OrgInfo[] = [];
 
@@ -129,13 +115,11 @@ function listOrgs(): OrgInfo[] {
       }
     };
 
-    // sf org list --json returns these buckets — devHubs appear in both devHubs AND nonScratchOrgs
     push(data.result?.devHubs,        true,  false);
     push(data.result?.sandboxes,      false, true);
     push(data.result?.scratchOrgs,    false, false);
     push(data.result?.nonScratchOrgs, false, false);
 
-    // Deduplicate: if an alias appeared in devHubs first, skip its nonScratchOrgs duplicate
     const seen = new Set<string>();
     return orgs.filter(o => {
       const key = o.alias || o.username;
@@ -148,16 +132,17 @@ function listOrgs(): OrgInfo[] {
   }
 }
 
-// ─── Repo Registry ───────────────────────────────────────────────────────────────
+// ─── Repo Registry ────────────────────────────────────────────────────────────
 
 function loadRepos(): RepoEntry[] {
   const file = path.join(__dirname, "repos.json");
   if (!fs.existsSync(file)) return [];
-  const raw: { name: string; path: string }[] = JSON.parse(fs.readFileSync(file, "utf8"));
-  return raw.map(r => ({ name: r.name, path: expandHome(r.path) }));
+  const raw: { name: string; path: string; testOrg?: string }[] =
+    JSON.parse(fs.readFileSync(file, "utf8"));
+  return raw.map(r => ({ name: r.name, path: expandHome(r.path), testOrg: r.testOrg }));
 }
 
-// ─── sfdx-project.json ──────────────────────────────────────────────────────────
+// ─── sfdx-project.json ───────────────────────────────────────────────────────
 
 function readProject(repoPath: string): SfdxProject {
   const file = path.join(repoPath, "sfdx-project.json");
@@ -173,9 +158,8 @@ function writeProject(repoPath: string, proj: SfdxProject): void {
   );
 }
 
-// ─── Version Helpers ────────────────────────────────────────────────────────────
+// ─── Version Helpers ──────────────────────────────────────────────────────────
 
-/** Parse "1.2.3.NEXT" → { major:1, minor:2, patch:3 } */
 function parseVersion(v: string): VersionParts | null {
   const m = v.match(/^(\d+)\.(\d+)\.(\d+)\.(NEXT|\d+)$/);
   if (!m) return null;
@@ -186,10 +170,10 @@ function formatVersion(v: VersionParts): string {
   return `${v.major}.${v.minor}.${v.patch}.NEXT`;
 }
 
-/**
- * Show current version and ask user whether to bump major, minor, or patch.
- * Returns the new versionNumber string (with .NEXT) to write to sfdx-project.json.
- */
+function versionLabel(v: string): string {
+  return v.replace(/\.NEXT$/, "").replace(/\.\d+$/, "");
+}
+
 async function promptVersionBump(current: string): Promise<string> {
   const parts = parseVersion(current);
   if (!parts) {
@@ -202,10 +186,9 @@ async function promptVersionBump(current: string): Promise<string> {
   console.log(`    1. Patch  →  ${major}.${minor}.${patch + 1}  (bug fixes, small changes)`);
   console.log(`    2. Minor  →  ${major}.${minor + 1}.0          (new features, backwards compatible)`);
   console.log(`    3. Major  →  ${major + 1}.0.0                 (breaking changes)`);
-  console.log(`    4. Keep   →  ${major}.${minor}.${patch}        (use current — only valid if no promoted version exists at this number)`);
+  console.log(`    4. Keep   →  ${major}.${minor}.${patch}        (only valid if no promoted version exists at this number)`);
 
   const choice = await ask("\n  Version bump: ");
-
   switch (choice) {
     case "1": return formatVersion({ major, minor, patch: patch + 1 });
     case "2": return formatVersion({ major, minor: minor + 1, patch: 0 });
@@ -217,21 +200,9 @@ async function promptVersionBump(current: string): Promise<string> {
   }
 }
 
-// ─── Namespace Injection ────────────────────────────────────────────────────────
+// ─── Namespace Injection ──────────────────────────────────────────────────────
 
-/**
- * Add Revecast__ prefix to a custom API name.
- * No-op if it's a standard name (no __c) or already namespaced.
- *
- *   Job__c                → Revecast__Job__c
- *   Status__c             → Revecast__Status__c
- *   Recruiter_Config__mdt → Revecast__Recruiter_Config__mdt
- *   Contact               → Contact          (standard, unchanged)
- *   Revecast__Job__c      → Revecast__Job__c  (already namespaced, unchanged)
- */
 function nsName(value: string): string {
-  // Match custom names ending in __c / __mdt / __e / __b
-  // Negative lookbehind: skip if already preceded by __  (i.e. already has a namespace prefix)
   return value.replace(
     /(?<![A-Za-z0-9]__)[A-Za-z][A-Za-z0-9_]*(__c|__mdt|__e|__b)\b/g,
     match => `${NAMESPACE}__${match}`
@@ -256,7 +227,6 @@ function injectPromptTemplate(content: string): string {
   );
 }
 
-/** Inject namespace into all flows and prompt templates under a directory. Returns backup map. */
 function injectAll(sourceDir: string): Map<string, string> {
   const backups = new Map<string, string>();
 
@@ -266,8 +236,8 @@ function injectAll(sourceDir: string): Map<string, string> {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) { walk(full); continue; }
 
-      let modified: string | null = null;
       const original = fs.readFileSync(full, "utf8");
+      let modified: string | null = null;
 
       if (entry.name.endsWith(".flow-meta.xml")) {
         modified = injectFlow(original);
@@ -295,7 +265,6 @@ function revertAll(backups: Map<string, string>): void {
   }
 }
 
-/** Return a preview of what would be injected (dry run). */
 function previewInjection(sourceDir: string): { file: string; additions: number }[] {
   const results: { file: string; additions: number }[] = [];
 
@@ -320,10 +289,7 @@ function previewInjection(sourceDir: string): { file: string; additions: number 
       if (modified && modified !== original) {
         const before = (original.match(new RegExp(`${NAMESPACE}__`, "g")) ?? []).length;
         const after  = (modified.match(new RegExp(`${NAMESPACE}__`, "g")) ?? []).length;
-        results.push({
-          file: path.relative(sourceDir, full),
-          additions: after - before,
-        });
+        results.push({ file: path.relative(sourceDir, full), additions: after - before });
       }
     }
   }
@@ -332,63 +298,338 @@ function previewInjection(sourceDir: string): { file: string; additions: number 
   return results;
 }
 
-// ─── Actions ─────────────────────────────────────────────────────────────────────
+// ─── Release Management ───────────────────────────────────────────────────────
+
+/** Git tag name for a specific package version. */
+function versionTagName(pkgDirPath: string, version: string): string {
+  const dirSlug = pkgDirPath.replace(/\//g, "-").replace(/[^a-zA-Z0-9-]/g, "");
+  return `pkg/${dirSlug}/${version}`;
+}
+
+/** Find the most recent git tag for this package directory (for release notes scoping). */
+function getLastVersionTag(repoPath: string, pkgDirPath: string): string | null {
+  try {
+    const dirSlug = pkgDirPath.replace(/\//g, "-").replace(/[^a-zA-Z0-9-]/g, "");
+    const tags = run(`git tag --list "pkg/${dirSlug}/*" --sort=-creatordate`, repoPath);
+    if (!tags) return null;
+    return tags.split("\n")[0].trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Create a git tag in the product repo to mark this package version. */
+function tagVersion(repoPath: string, pkgDirPath: string, version: string): void {
+  const tag = versionTagName(pkgDirPath, version);
+  try {
+    run(`git tag ${tag}`, repoPath);
+  } catch { /* tag may already exist */ }
+}
+
+/** Get commit log since a tag (or all commits if no tag), scoped to a package directory. */
+interface CommitEntry {
+  hash: string;
+  subject: string;
+  author: string;
+  date: string;
+}
+
+function getCommitsSince(repoPath: string, pkgDirPath: string, sinceTag: string | null): CommitEntry[] {
+  try {
+    const since = sinceTag ? `${sinceTag}..HEAD` : "HEAD";
+    const raw = run(
+      `git log ${since} --pretty=format:"%H|%s|%an|%ad" --date=short -- ${pkgDirPath}`,
+      repoPath
+    );
+    if (!raw) return [];
+    return raw.split("\n").filter(Boolean).map(line => {
+      const [hash, subject, author, date] = line.split("|");
+      return { hash: hash?.slice(0, 7) ?? "", subject: subject ?? "", author: author ?? "", date: date ?? "" };
+    });
+  } catch {
+    return [];
+  }
+}
 
 /**
- * Interactively build a dependencies array for a packageDirectory entry.
- * Looks at all known package aliases (from all repos' sfdx-project.json files)
- * plus any already declared in this repo, and lets the user pick.
+ * Parse FEATURES.md in the product repo and extract entries relevant to a package directory.
+ * FEATURES.md entries look like:
+ *   ## Feature Name — YYYY-MM-DD
+ *   **Sub-packages:** package-recruiter
  */
+interface FeatureEntry {
+  title: string;
+  date: string;
+  subpackages: string[];
+  description: string;
+  components: string;
+  setup: string;
+}
+
+function parseFeaturesForPackage(repoPath: string, pkgDirName: string, sinceDate?: string): FeatureEntry[] {
+  const file = path.join(repoPath, "docs", "FEATURES.md");
+  if (!fs.existsSync(file)) return [];
+
+  const content = fs.readFileSync(file, "utf8");
+
+  // Split on ## headings (feature entries)
+  const sections = content.split(/^(?=## )/m).filter(s => s.startsWith("## "));
+  const entries: FeatureEntry[] = [];
+
+  for (const section of sections) {
+    const titleLine = section.match(/^## (.+?) — (\d{4}-\d{2}-\d{2})/m);
+    if (!titleLine) continue;
+
+    const title = titleLine[1].trim();
+    const date  = titleLine[2].trim();
+
+    // Skip entries older than sinceDate
+    if (sinceDate && date < sinceDate) continue;
+
+    const subpackagesMatch = section.match(/\*\*Sub-packages:\*\*\s*(.+)/);
+    const subpackages = subpackagesMatch
+      ? subpackagesMatch[1].split(",").map(s => s.trim())
+      : [];
+
+    // Only include if this package dir is mentioned
+    if (!subpackages.some(sp => pkgDirName.includes(sp) || sp.includes(pkgDirName))) continue;
+
+    // Extract "What it does" section
+    const whatMatch = section.match(/###\s+What it does\n([\s\S]*?)(?=###|$)/);
+    const description = whatMatch ? whatMatch[1].trim() : "";
+
+    // Extract "New components" table
+    const compMatch = section.match(/###\s+New components\n([\s\S]*?)(?=###|$)/);
+    const components = compMatch ? compMatch[1].trim() : "";
+
+    // Extract "Setup required"
+    const setupMatch = section.match(/###\s+Setup required\n([\s\S]*?)(?=###|$)/);
+    const setup = setupMatch ? setupMatch[1].trim() : "";
+
+    entries.push({ title, date, subpackages, description, components, setup });
+  }
+
+  return entries;
+}
+
+/** Install URL for a specific version ID. */
+function getInstallUrls(versionId: string): { sandbox: string; production: string } {
+  return {
+    sandbox:    `https://test.salesforce.com/packaging/installPackage.apexp?p0=${versionId}`,
+    production: `https://login.salesforce.com/packaging/installPackage.apexp?p0=${versionId}`,
+  };
+}
+
+/** Find the new version alias/ID added to sfdx-project.json after version create. */
+function findNewVersionId(
+  repoPath: string,
+  prevAliases: Record<string, string>
+): { alias: string; id: string } | null {
+  try {
+    const proj = readProject(repoPath);
+    for (const [alias, id] of Object.entries(proj.packageAliases ?? {})) {
+      if (id.startsWith("04t") && !prevAliases[alias]) {
+        return { alias, id };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Build a full markdown release notes document for this version. */
+function buildReleaseNotes(
+  repo: RepoEntry,
+  pkgDir: PackageDir,
+  version: string,
+  versionId: string,
+  sinceTag: string | null,
+  installKey: string
+): string {
+  const today = new Date().toISOString().split("T")[0];
+  const urls  = getInstallUrls(versionId);
+
+  // Get commits scoped to this package directory since last tag
+  const commits = getCommitsSince(repo.path, pkgDir.path, sinceTag);
+
+  // Get sinceDate from git tag for FEATURES.md filtering
+  let sinceDate: string | undefined;
+  if (sinceTag) {
+    try {
+      sinceDate = run(`git log -1 --format=%ad --date=short ${sinceTag}`, repo.path);
+    } catch { /* ignore */ }
+  }
+
+  // Parse feature entries from FEATURES.md
+  const features = parseFeaturesForPackage(repo.path, pkgDir.path, sinceDate);
+
+  const lines: string[] = [];
+  lines.push(`# ${pkgDir.package} — v${version}`);
+  lines.push(`Released: ${today}  |  Package: \`${versionId}\``);
+  lines.push("");
+
+  // Install info
+  lines.push("## Install");
+  lines.push("");
+  lines.push("**Sandbox / Developer org:**");
+  lines.push(`\`\`\``);
+  lines.push(`sf package install --package ${versionId} --installation-key ${installKey} --wait 10 --target-org <alias>`);
+  lines.push(`\`\`\``);
+  lines.push(`Or use the install URL: ${urls.sandbox}`);
+  lines.push("");
+  lines.push("**Production (promoted versions only):**");
+  lines.push(`Or use the install URL: ${urls.production}`);
+  lines.push("");
+
+  // Features
+  if (features.length > 0) {
+    lines.push("## What's New");
+    lines.push("");
+    for (const f of features) {
+      lines.push(`### ${f.title}`);
+      if (f.description) lines.push(f.description);
+      if (f.components) {
+        lines.push("");
+        lines.push("**New components:**");
+        lines.push(f.components);
+      }
+      if (f.setup && f.setup.toLowerCase() !== "none — automatically active after install.") {
+        lines.push("");
+        lines.push("**Setup required:**");
+        lines.push(f.setup);
+      }
+      lines.push("");
+    }
+  }
+
+  // Commits
+  if (commits.length > 0) {
+    lines.push("## Commits");
+    lines.push("");
+    for (const c of commits) {
+      lines.push(`- \`${c.hash}\` ${c.subject}  _(${c.date})_`);
+    }
+    lines.push("");
+  }
+
+  // Post-install steps
+  const setupSteps = features
+    .filter(f => f.setup && f.setup.toLowerCase() !== "none — automatically active after install.")
+    .map(f => ({ title: f.title, setup: f.setup }));
+
+  if (setupSteps.length > 0) {
+    lines.push("## Post-Install Steps");
+    lines.push("");
+    lines.push("The following features require manual configuration after installation:");
+    lines.push("");
+    for (const s of setupSteps) {
+      lines.push(`### ${s.title}`);
+      lines.push(s.setup);
+      lines.push("");
+    }
+  }
+
+  return lines.join("\n");
+}
+
+/** Append or create docs/RELEASES.md in the product repo. */
+function writeReleasesFile(repoPath: string, pkgName: string, version: string, notes: string): string {
+  const docsDir = path.join(repoPath, "docs");
+  if (!fs.existsSync(docsDir)) fs.mkdirSync(docsDir, { recursive: true });
+
+  const file = path.join(docsDir, "RELEASES.md");
+  const divider = "\n\n---\n\n";
+
+  // Also write a standalone per-version file
+  const versionFile = path.join(docsDir, `${pkgName.replace(/[^a-zA-Z0-9-]/g, "-")}-v${version}.md`);
+  fs.writeFileSync(versionFile, notes, "utf8");
+
+  // Prepend to RELEASES.md (newest first)
+  const existing = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+  const header = existing.startsWith("# Release History") ? "" : "# Release History\n\n";
+  const newContent = header + notes + divider + existing.replace(/^# Release History\n\n/, "");
+  fs.writeFileSync(file, newContent, "utf8");
+
+  return versionFile;
+}
+
+/** Update or create a ## Latest Package Versions section in the product repo's README.md. */
+function updateProductReadme(
+  repoPath: string,
+  pkgName: string,
+  version: string,
+  versionId: string,
+  installKey: string
+): void {
+  const readmeFile = path.join(repoPath, "README.md");
+  if (!fs.existsSync(readmeFile)) return;
+
+  const content  = fs.readFileSync(readmeFile, "utf8");
+  const today    = new Date().toISOString().split("T")[0];
+  const urls     = getInstallUrls(versionId);
+
+  const newSection = [
+    "## Latest Package Versions",
+    "",
+    "| Package | Version | ID | Released |",
+    "|---------|---------|-----|----------|",
+    `| ${pkgName} | ${version} | \`${versionId}\` | ${today} |`,
+    "",
+    `**Install (sandbox):** \`sf package install --package ${versionId} --installation-key ${installKey} --target-org <alias>\``,
+    "",
+    `**Install URL (sandbox):** ${urls.sandbox}`,
+    "",
+  ].join("\n");
+
+  // Replace existing section if present, otherwise append
+  const sectionRegex = /^## Latest Package Versions[\s\S]*?(?=^## |\Z)/m;
+  const updated = sectionRegex.test(content)
+    ? content.replace(sectionRegex, newSection + "\n")
+    : content.trimEnd() + "\n\n" + newSection;
+
+  fs.writeFileSync(readmeFile, updated, "utf8");
+}
+
+// ─── Actions ─────────────────────────────────────────────────────────────────
+
 async function promptDependencies(
   repo: RepoEntry,
   allRepos: RepoEntry[],
   existingDeps: PackageDependency[]
 ): Promise<PackageDependency[]> {
-  // Collect all known packages across all repos
-  const knownPackages: { label: string; alias: string; id: string }[] = [];
+  const knownPackages: { label: string; alias: string }[] = [];
 
   for (const r of allRepos) {
     try {
       const proj = readProject(r.path);
       for (const [alias, id] of Object.entries(proj.packageAliases ?? {})) {
-        // Only package wrappers (0Ho) — not version IDs (04t)
         if (id.startsWith("0Ho")) {
-          knownPackages.push({ label: `${r.name} → ${alias}`, alias, id });
+          knownPackages.push({ label: `${r.name} → ${alias}`, alias });
         }
       }
-      // Also include unregistered packages that exist as packageDirectory entries
       for (const d of proj.packageDirectories) {
         if (d.package && !knownPackages.find(k => k.alias === d.package)) {
-          knownPackages.push({ label: `${r.name} → ${d.package} (no ID yet)`, alias: d.package!, id: "" });
+          knownPackages.push({ label: `${r.name} → ${d.package} (no ID yet)`, alias: d.package! });
         }
       }
-    } catch { /* skip repos that can't be read */ }
+    } catch { /* skip */ }
   }
 
-  // Dedupe
   const seen = new Set<string>();
-  const unique = knownPackages.filter(k => {
-    if (seen.has(k.alias)) return false;
-    seen.add(k.alias);
-    return true;
-  });
+  const unique = knownPackages.filter(k => { if (seen.has(k.alias)) return false; seen.add(k.alias); return true; });
 
-  if (unique.length === 0) {
-    console.log("  No other packages found to add as dependencies.");
-    return existingDeps;
-  }
+  if (unique.length === 0) { console.log("  No other packages found."); return existingDeps; }
 
   const deps = [...existingDeps];
-
   console.log();
-  console.log("  Configure dependencies (packages that must be installed before this one).");
   console.log("  Current dependencies: " + (deps.length ? deps.map(d => d.package).join(", ") : "none"));
   console.log();
 
   while (true) {
     console.log("  Available packages:");
     unique.forEach((k, i) => {
-      const already = deps.find(d => d.package === k.alias) ? "  ✓ already added" : "";
+      const already = deps.find(d => d.package === k.alias) ? "  ✓" : "";
       console.log(`    ${i + 1}. ${k.label}${already}`);
     });
     console.log(`    ${unique.length + 1}. Done`);
@@ -398,105 +639,75 @@ async function promptDependencies(
     if (choice < 1 || choice > unique.length) { console.log("  Invalid."); continue; }
 
     const selected = unique[choice - 1];
-    if (deps.find(d => d.package === selected.alias)) {
-      console.log(`  Already added: ${selected.alias}`);
-      continue;
-    }
+    if (deps.find(d => d.package === selected.alias)) { console.log(`  Already added.`); continue; }
 
-    const versionInput = await ask(`  Version constraint for ${selected.alias} (default: LATEST, or enter e.g. 1.0): `);
+    const versionInput = await ask(`  Version constraint (default: LATEST, or e.g. 1.0): `);
     const versionNumber = versionInput ? `${versionInput}.0.LATEST` : "LATEST";
-
     deps.push({ package: selected.alias, versionNumber });
-    console.log(`  ✓ Added dependency: ${selected.alias} @ ${versionNumber}`);
+    console.log(`  ✓ Added: ${selected.alias} @ ${versionNumber}`);
   }
 
   return deps;
 }
 
 async function actionManageDependencies(repo: RepoEntry, allRepos: RepoEntry[]): Promise<void> {
-  const proj = readProject(repo.path);
+  const proj    = readProject(repo.path);
   const packaged = proj.packageDirectories.filter(d => d.package);
+  if (packaged.length === 0) { console.log("\n  No registered packages."); return; }
 
-  if (packaged.length === 0) {
-    console.log("\n  No registered packages found. Register a package first.");
-    return;
-  }
-
-  console.log("\n  Which sub-package to configure dependencies for?");
+  console.log("\n  Configure dependencies for:");
   packaged.forEach((d, i) => {
-    const depStr = d.dependencies?.length
-      ? d.dependencies.map(dep => dep.package).join(", ")
-      : "none";
+    const depStr = d.dependencies?.length ? d.dependencies.map(x => x.package).join(", ") : "none";
     console.log(`    ${i + 1}. ${d.package}  (${d.path})  deps: ${depStr}`);
   });
 
   const idx = parseInt(await ask("\n  Sub-package #: ")) - 1;
   if (idx < 0 || idx >= packaged.length) { console.log("  Cancelled."); return; }
-
   const entry = packaged[idx];
-  const updated = await promptDependencies(repo, allRepos, entry.dependencies ?? []);
 
-  // Write back
-  const fresh = readProject(repo.path);
+  const updated = await promptDependencies(repo, allRepos, entry.dependencies ?? []);
+  const fresh   = readProject(repo.path);
   const freshEntry = fresh.packageDirectories.find(d => d.path === entry.path)!;
   freshEntry.dependencies = updated.length > 0 ? updated : undefined;
   writeProject(repo.path, fresh);
 
-  console.log(`\n  ✓ Dependencies updated for ${entry.package}:`);
-  if (updated.length === 0) {
-    console.log("  (none)");
-  } else {
-    updated.forEach(d => console.log(`  • ${d.package} @ ${d.versionNumber ?? "LATEST"}`));
-  }
-  console.log("\n  sfdx-project.json updated. Commit when ready.");
+  console.log(`\n  ✓ Dependencies saved for ${entry.package}.`);
+  if (updated.length) updated.forEach(d => console.log(`  • ${d.package} @ ${d.versionNumber ?? "LATEST"}`));
+  else console.log("  (none)");
 }
 
 async function actionCreatePackage(repo: RepoEntry, devHub: string, allRepos: RepoEntry[]): Promise<void> {
-  const proj = readProject(repo.path);
-
-  console.log();
-  console.log("  Register a new 2GP package wrapper in the DevHub.");
-  console.log("  Run this once per sub-package. The package ID (0Ho...) is saved to sfdx-project.json.");
-  console.log();
-
+  const proj        = readProject(repo.path);
   const unregistered = proj.packageDirectories.filter(d => !d.package);
   const registered   = proj.packageDirectories.filter(d =>  d.package);
 
+  console.log();
   if (registered.length > 0) {
     console.log("  Already registered:");
     registered.forEach(d => console.log(`    • ${d.path}  →  ${d.package}`));
     console.log();
   }
-
-  if (unregistered.length === 0) {
-    console.log("  All package directories are already registered.");
-    return;
-  }
+  if (unregistered.length === 0) { console.log("  All directories already registered."); return; }
 
   console.log("  Unregistered directories:");
   unregistered.forEach((d, i) => console.log(`    ${i + 1}. ${d.path}`));
 
-  const idx = parseInt(await ask("\n  Which directory to register? ")) - 1;
+  const idx = parseInt(await ask("\n  Which to register? ")) - 1;
   if (idx < 0 || idx >= unregistered.length) { console.log("  Cancelled."); return; }
   const dir = unregistered[idx];
 
   const defaultName = repo.name + (unregistered.length > 1 ? `-${dir.path}` : "");
-  const pkgName = await ask(`  Package name (default: ${defaultName}): `) || defaultName;
+  const pkgName     = await ask(`  Package name (default: ${defaultName}): `) || defaultName;
 
   console.log();
-  console.log(`  Running: sf package create --name "${pkgName}" --package-type Managed --path ${dir.path} --target-dev-hub ${devHub}`);
-  console.log();
-
   try {
     runLive(
       `sf package create --name "${pkgName}" --package-type Managed --path ${dir.path} --target-dev-hub ${devHub}`,
       repo.path
     );
 
-    // sf package create writes the 0Ho... ID to packageAliases in sfdx-project.json.
-    // Also fill in the package/version fields on the packageDirectory entry.
     const updated = readProject(repo.path);
-    const entry = updated.packageDirectories.find(d => d.path === dir.path);
+    const entry   = updated.packageDirectories.find(d => d.path === dir.path);
     if (entry && !entry.package) {
       entry.package       = pkgName;
       entry.versionName   = "ver 1.0";
@@ -504,15 +715,13 @@ async function actionCreatePackage(repo: RepoEntry, devHub: string, allRepos: Re
       writeProject(repo.path, updated);
     }
 
-    console.log(`\n  ✓ Package "${pkgName}" registered. sfdx-project.json updated.`);
+    console.log(`\n  ✓ "${pkgName}" registered. sfdx-project.json updated.`);
 
-    // Offer to configure dependencies immediately
-    const addDeps = await ask("\n  Configure dependencies now? (e.g. revecast-base must install first) (Y/n) ");
+    const addDeps = await ask("\n  Configure dependencies now? (Y/n) ");
     if (addDeps.toLowerCase() !== "n") {
       await actionManageDependencies(repo, allRepos);
     }
-
-    console.log("\n  Next: run 'Create package version' to build a beta version.");
+    console.log("\n  Next: run 'Create package version' to build a beta.");
 
   } catch (err: any) {
     console.error(`\n  ✗ Failed: ${err.message}`);
@@ -520,90 +729,86 @@ async function actionCreatePackage(repo: RepoEntry, devHub: string, allRepos: Re
 }
 
 async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<void> {
-  const proj = readProject(repo.path);
+  const proj    = readProject(repo.path);
   const packaged = proj.packageDirectories.filter(d => d.package);
 
   if (packaged.length === 0) {
-    console.log("\n  No packages registered in sfdx-project.json.");
-    console.log("  Run 'Register new package' first.");
+    console.log("\n  No packages registered. Run 'Register new package' first.");
     return;
   }
 
-  // Pick sub-package
   console.log();
   if (packaged.length === 1) {
     console.log(`  Package: ${packaged[0].package}  (${packaged[0].path})`);
   } else {
     console.log("  Packages:");
-    packaged.forEach((d, i) => {
-      const v = d.versionNumber ?? "?";
-      console.log(`    ${i + 1}. ${d.package}  (${d.path})  current: ${v}`);
-    });
+    packaged.forEach((d, i) => console.log(`    ${i + 1}. ${d.package}  (${d.path})  v${d.versionNumber ?? "?"}`));
   }
 
   let pkgDir: PackageDir;
   if (packaged.length === 1) {
     pkgDir = packaged[0];
   } else {
-    const idx = parseInt(await ask("\n  Which package to version? ")) - 1;
+    const idx = parseInt(await ask("\n  Which to version? ")) - 1;
     if (idx < 0 || idx >= packaged.length) { console.log("  Cancelled."); return; }
     pkgDir = packaged[idx];
   }
 
-  // Version bump
   const currentVersion = pkgDir.versionNumber ?? "1.0.0.NEXT";
-  const newVersion = await promptVersionBump(currentVersion);
+  const newVersion     = await promptVersionBump(currentVersion);
+  const versionShort   = versionLabel(newVersion);
 
-  // Install key
-  const keyInput = await ask(`\n  Installation key (default: ${DEFAULT_INSTALL_KEY}, press Enter to use default): `);
+  const keyInput   = await ask(`\n  Installation key (default: ${DEFAULT_INSTALL_KEY}): `);
   const installKey = keyInput || DEFAULT_INSTALL_KEY;
 
-  // Version description
   const description = await ask("  Version description (optional): ");
 
-  // Namespace injection preview
   const sourceDir = path.join(repo.path, pkgDir.path);
-  const preview = previewInjection(sourceDir);
+  const preview   = previewInjection(sourceDir);
 
   console.log();
   if (preview.length > 0) {
-    console.log(`  Namespace injection  (${NAMESPACE}__ added before package version create, reverted after):`);
-    preview.forEach(({ file, additions }) =>
-      console.log(`    ${file}  (+${additions} references)`)
-    );
+    console.log(`  Namespace injection (${NAMESPACE}__ added before create, reverted after):`);
+    preview.forEach(({ file, additions }) => console.log(`    ${file}  (+${additions})`));
   } else {
-    console.log("  No namespace injection needed (no un-prefixed custom API names found in flows/prompt templates).");
+    console.log("  No namespace injection needed.");
   }
 
-  // Summary before proceeding
+  // Find previous tag for release notes scoping
+  const prevTag     = getLastVersionTag(repo.path, pkgDir.path);
   const hadNamespace = !!proj.namespace;
+
   console.log();
   console.log("  " + hr());
   console.log(`  Package:        ${pkgDir.package}`);
-  console.log(`  Version:        ${newVersion.replace(".NEXT", "")}  (${currentVersion} → ${newVersion})`);
+  console.log(`  Version:        ${versionShort}`);
   console.log(`  Install key:    ${installKey}`);
   console.log(`  DevHub:         ${devHub}`);
-  console.log(`  Namespace:      ${hadNamespace ? "already set" : "will be added temporarily"}`);
+  console.log(`  Namespace:      ${hadNamespace ? "already set" : "temporarily added"}`);
+  console.log(`  Prev tag:       ${prevTag ?? "none (first version — all commits included)"}`);
+  if (repo.testOrg) {
+    console.log(`  Auto-install:   ${repo.testOrg} (from repos.json)`);
+  }
   console.log("  " + hr());
 
   const go = await ask("\n  Proceed? (Y/n) ");
   if (go.toLowerCase() === "n") { console.log("  Cancelled."); return; }
 
-  // Apply version bump to sfdx-project.json
+  // Update sfdx-project.json with new version + temp namespace
   const workProj = readProject(repo.path);
-  const workDir = workProj.packageDirectories.find(d => d.path === pkgDir.path)!;
+  const workDir  = workProj.packageDirectories.find(d => d.path === pkgDir.path)!;
   workDir.versionNumber = newVersion;
   if (description) workDir.versionDescription = description;
   if (!workProj.namespace) workProj.namespace = NAMESPACE;
   writeProject(repo.path, workProj);
 
-  // Apply namespace injection
-  const backups = injectAll(sourceDir);
-  if (backups.size > 0) {
-    console.log(`\n  ✓ Namespace injected into ${backups.size} file(s)`);
-  }
+  // Snapshot aliases before version create so we can find the new one
+  const prevAliases = { ...(readProject(repo.path).packageAliases ?? {}) };
 
-  // Run package version create
+  // Namespace injection
+  const backups = injectAll(sourceDir);
+  if (backups.size > 0) console.log(`\n  ✓ Namespace injected into ${backups.size} file(s)`);
+
   const args = [
     `sf package version create`,
     `--package "${pkgDir.package}"`,
@@ -617,18 +822,32 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
   console.log("  Creating package version — this takes 10–30 minutes...");
   console.log();
 
-  let success = false;
+  let success   = false;
+  let versionId = "";
+
   try {
     runLive(args.join(" "), repo.path);
     success = true;
 
+    // Find the new version ID from updated sfdx-project.json
+    const newVersion_ = findNewVersionId(repo.path, prevAliases);
+    versionId         = newVersion_?.id ?? "";
+
     console.log();
-    console.log("  ✓ Package version created.");
-    console.log("  sfdx-project.json updated with new version alias by --wait 60.");
-    console.log();
-    console.log("  Next steps:");
-    console.log("  • Install in a dev/scratch org to test");
-    console.log("  • When ready: Promote to Released");
+    console.log("  " + hr());
+    console.log(`  ✓ Package version created: ${pkgDir.package} v${versionShort}`);
+    if (versionId) {
+      console.log(`  Version ID: ${versionId}`);
+      const urls = getInstallUrls(versionId);
+      console.log();
+      console.log("  Install URLs:");
+      console.log(`    Sandbox:    ${urls.sandbox}`);
+      console.log(`    Production: ${urls.production}`);
+      console.log();
+      console.log("  CLI install command:");
+      console.log(`    sf package install --package ${versionId} --installation-key ${installKey} --wait 10 --target-org <alias>`);
+    }
+    console.log("  " + hr());
 
   } catch (err: any) {
     console.error("\n  ✗ Version creation failed:\n");
@@ -636,18 +855,17 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
     console.log();
     console.log("  Common causes:");
     console.log("  • No namespace registry on DevHub — Setup → Company Profile → Packages → Namespace Registries");
-    console.log("  • Apex test failures (required 75% coverage for managed packages)");
-    console.log("  • Metadata type not supported in managed packages");
+    console.log("  • Apex test failures — managed packages require 75% coverage");
+    console.log("  • Metadata type not packageable in managed packages");
     console.log("  • Already promoted a version at this major.minor — bump version and retry");
-    console.log("  • Component exists in multiple package directories (2GP allows only one owner)");
+    console.log("  • Component exists in multiple package directories");
   }
 
-  // Always revert namespace injection and sfdx-project.json namespace field
+  // Always revert namespace
   if (backups.size > 0) {
     revertAll(backups);
-    console.log(`\n  ✓ Namespace injection reverted — files back to dev-friendly state`);
+    console.log(`\n  ✓ Namespace injection reverted`);
   }
-
   if (!hadNamespace) {
     const clean = readProject(repo.path);
     delete clean.namespace;
@@ -655,48 +873,97 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
     console.log("  ✓ Temporary namespace removed from sfdx-project.json");
   }
 
-  // Commit sfdx-project.json if version was created
-  if (success) {
-    const commitAns = await ask("\n  Commit updated sfdx-project.json? (Y/n) ");
-    if (commitAns.toLowerCase() !== "n") {
+  if (!success) return;
+
+  // ── Post-success: release notes, README, tag, auto-install ──────────────
+
+  // Tag the product repo at this version (for future release notes scoping)
+  try {
+    tagVersion(repo.path, pkgDir.path, versionShort);
+    console.log(`  ✓ Tagged repo: ${versionTagName(pkgDir.path, versionShort)}`);
+  } catch { /* non-fatal */ }
+
+  // Generate release notes
+  let releaseNotesPath = "";
+  if (versionId) {
+    try {
+      const notes  = buildReleaseNotes(repo, pkgDir, versionShort, versionId, prevTag, installKey);
+      releaseNotesPath = writeReleasesFile(repo.path, pkgDir.package!, versionShort, notes);
+      console.log(`  ✓ Release notes written → ${path.relative(repo.path, releaseNotesPath)}`);
+      console.log(`     Also appended to docs/RELEASES.md`);
+    } catch (e: any) {
+      console.log(`  ! Release notes skipped: ${e.message}`);
+    }
+
+    // Update README
+    try {
+      updateProductReadme(repo.path, pkgDir.package!, versionShort, versionId, installKey);
+      console.log(`  ✓ README.md updated with latest version info`);
+    } catch (e: any) {
+      console.log(`  ! README update skipped: ${e.message}`);
+    }
+  }
+
+  // Auto-install to test org if configured
+  if (repo.testOrg && versionId) {
+    console.log();
+    const autoInstallAns = await ask(`  Auto-install to test org "${repo.testOrg}"? (Y/n) `);
+    if (autoInstallAns.toLowerCase() !== "n") {
+      console.log();
       try {
-        run("git add sfdx-project.json", repo.path);
-        run(
-          `git commit -m "chore(packaging): ${pkgDir.package} version ${newVersion.replace(".NEXT", "")}"`,
+        runLive(
+          `sf package install --package ${versionId} --target-org ${repo.testOrg} --installation-key ${installKey} --wait 10`,
           repo.path
         );
-        console.log("  ✓ Committed");
-      } catch (e: any) {
-        console.log(`  ! Git commit skipped: ${e.message}`);
+        console.log(`\n  ✓ Installed in ${repo.testOrg}`);
+      } catch (err: any) {
+        console.error(`\n  ✗ Auto-install failed: ${err.message}`);
+        console.log("  The package was created successfully — you can install manually using the URL above.");
       }
+    }
+  } else if (versionId) {
+    console.log();
+    console.log("  Tip: add a \"testOrg\" to repos.json to enable auto-install after each version create.");
+  }
+
+  // Commit all changes to the product repo
+  console.log();
+  const commitAns = await ask("  Commit release files to product repo? (sfdx-project.json, RELEASES.md, README.md) (Y/n) ");
+  if (commitAns.toLowerCase() !== "n") {
+    try {
+      run("git add sfdx-project.json docs/RELEASES.md README.md docs/ 2>/dev/null; git add -u", repo.path);
+      run(
+        `git commit -m "chore(release): ${pkgDir.package} v${versionShort}"`,
+        repo.path
+      );
+      console.log("  ✓ Committed");
+    } catch (e: any) {
+      console.log(`  ! Commit skipped: ${e.message}`);
     }
   }
 }
 
 async function actionPromote(repo: RepoEntry, devHub: string): Promise<void> {
-  const proj = readProject(repo.path);
+  const proj    = readProject(repo.path);
   const aliases = Object.entries(proj.packageAliases ?? {}).filter(([, id]) => id.startsWith("04t"));
 
   if (aliases.length === 0) {
-    console.log("\n  No package versions found in sfdx-project.json.");
-    console.log("  Create a version first.");
+    console.log("\n  No package versions found. Create a version first.");
     return;
   }
 
-  console.log("\n  Package versions (from sfdx-project.json):");
+  console.log("\n  Package versions:");
   aliases.forEach(([alias, id], i) => console.log(`    ${i + 1}. ${alias}  (${id})`));
-  console.log();
-  console.log("  Not seeing all versions? Run 'List all versions' to see everything in the DevHub.");
+  console.log("\n  Not seeing all versions? Run 'List all versions'.");
 
   const idx = parseInt(await ask("\n  Which version to promote? ")) - 1;
   if (idx < 0 || idx >= aliases.length) { console.log("  Cancelled."); return; }
-
   const [alias, versionId] = aliases[idx];
 
   console.log();
   console.log("  ⚠️  WARNING: Promotion cannot be undone.");
-  console.log(`  ${alias} will become a Released version installable in production.`);
-  console.log("  After promotion, you must bump the version number before creating new betas at this major.minor.");
+  console.log(`  ${alias} will become Released — installable in production.`);
+  console.log("  You must bump the version number before creating new betas at this major.minor.");
   console.log();
 
   const confirm = await ask("  Type PROMOTE to confirm: ");
@@ -704,20 +971,19 @@ async function actionPromote(repo: RepoEntry, devHub: string): Promise<void> {
 
   try {
     runLive(`sf package version promote --package ${versionId} --target-dev-hub ${devHub}`, repo.path);
+    const urls = getInstallUrls(versionId);
     console.log(`\n  ✓ ${alias} promoted to Released.`);
+    console.log(`  Production install URL: ${urls.production}`);
   } catch (err: any) {
     console.error(`\n  ✗ Promote failed: ${err.message}`);
   }
 }
 
 async function actionInstall(repo: RepoEntry, allOrgs: OrgInfo[]): Promise<void> {
-  const proj = readProject(repo.path);
+  const proj    = readProject(repo.path);
   const aliases = Object.entries(proj.packageAliases ?? {}).filter(([, id]) => id.startsWith("04t"));
 
-  if (aliases.length === 0) {
-    console.log("\n  No package versions found in sfdx-project.json.");
-    return;
-  }
+  if (aliases.length === 0) { console.log("\n  No package versions found."); return; }
 
   console.log("\n  Package versions:");
   aliases.forEach(([alias, id], i) => console.log(`    ${i + 1}. ${alias}  (${id})`));
@@ -726,24 +992,20 @@ async function actionInstall(repo: RepoEntry, allOrgs: OrgInfo[]): Promise<void>
   if (vIdx < 0 || vIdx >= aliases.length) { console.log("  Cancelled."); return; }
   const [, versionId] = aliases[vIdx];
 
-  // Target org — exclude DevHubs from this list since you don't install packages in DevHubs
   const targetOrgs = allOrgs.filter(o => !o.isDevHub);
-  if (targetOrgs.length === 0) {
-    console.log("  No target orgs found. Authenticate with: sf org login web --alias <alias>");
-    return;
-  }
+  if (targetOrgs.length === 0) { console.log("  No target orgs found."); return; }
 
   console.log("\n  Target org:");
   targetOrgs.forEach((o, i) => {
     const type = o.isSandbox ? "Sandbox" : "Scratch/Dev";
-    console.log(`    ${i + 1}. ${o.alias}  (${type}  ${o.username})`);
+    console.log(`    ${i + 1}. ${o.alias}  (${type})`);
   });
 
   const oIdx = parseInt(await ask("\n  Install in which org? ")) - 1;
   if (oIdx < 0 || oIdx >= targetOrgs.length) { console.log("  Cancelled."); return; }
   const targetOrg = targetOrgs[oIdx].alias;
 
-  const keyInput = await ask(`\n  Installation key (default: ${DEFAULT_INSTALL_KEY}): `);
+  const keyInput   = await ask(`\n  Installation key (default: ${DEFAULT_INSTALL_KEY}): `);
   const installKey = keyInput || DEFAULT_INSTALL_KEY;
 
   console.log();
@@ -752,21 +1014,19 @@ async function actionInstall(repo: RepoEntry, allOrgs: OrgInfo[]): Promise<void>
       `sf package install --package ${versionId} --target-org ${targetOrg} --installation-key ${installKey} --wait 10`,
       repo.path
     );
+    const urls = getInstallUrls(versionId);
     console.log(`\n  ✓ Installed in ${targetOrg}.`);
+    console.log(`  Install URL: ${urls.sandbox}`);
   } catch (err: any) {
     console.error(`\n  ✗ Install failed: ${err.message}`);
-    console.log("  If this is a dependency error, make sure revecast-base is installed first.");
+    console.log("  If dependency error, ensure revecast-base is installed first.");
   }
 }
 
 async function actionListVersions(repo: RepoEntry, devHub: string): Promise<void> {
-  const proj = readProject(repo.path);
+  const proj    = readProject(repo.path);
   const packaged = proj.packageDirectories.filter(d => d.package);
-
-  if (packaged.length === 0) {
-    console.log("\n  No packages registered in sfdx-project.json.");
-    return;
-  }
+  if (packaged.length === 0) { console.log("\n  No packages registered."); return; }
 
   let pkgName: string;
   if (packaged.length === 1) {
@@ -774,7 +1034,7 @@ async function actionListVersions(repo: RepoEntry, devHub: string): Promise<void
   } else {
     console.log("\n  Packages:");
     packaged.forEach((d, i) => console.log(`    ${i + 1}. ${d.package}`));
-    const idx = parseInt(await ask("\n  Which package? ")) - 1;
+    const idx = parseInt(await ask("\n  Which? ")) - 1;
     if (idx < 0 || idx >= packaged.length) { console.log("  Cancelled."); return; }
     pkgName = packaged[idx].package!;
   }
@@ -787,14 +1047,12 @@ async function actionListVersions(repo: RepoEntry, devHub: string): Promise<void
   }
 }
 
-// ─── Main ────────────────────────────────────────────────────────────────────────
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
   banner();
 
-  // ── 1. Select repo ──────────────────────────────────────────────────────────
   const repos = loadRepos().filter(r => fs.existsSync(r.path));
-
   if (repos.length === 0) {
     console.log("  No repos found. Edit repos.json to add your repo paths.");
     rl.close();
@@ -803,29 +1061,23 @@ async function main(): Promise<void> {
 
   console.log("  Repos:");
   repos.forEach((r, i) => {
-    const proj = (() => { try { return readProject(r.path); } catch { return null; } })();
+    const proj     = (() => { try { return readProject(r.path); } catch { return null; } })();
     const pkgCount = proj?.packageDirectories.filter(d => d.package).length ?? 0;
     const total    = proj?.packageDirectories.length ?? 0;
     const status   = pkgCount > 0
       ? `${pkgCount}/${total} sub-packages registered`
       : total > 0 ? `${total} sub-package(s), none registered yet` : "no packageDirectories";
-    console.log(`    ${i + 1}. ${r.name.padEnd(24)} ${status}`);
+    const testTag  = r.testOrg ? `  [test: ${r.testOrg}]` : "";
+    console.log(`    ${i + 1}. ${r.name.padEnd(24)} ${status}${testTag}`);
   });
 
   const rIdx = parseInt(await ask("\n  Select repo: ")) - 1;
-  if (rIdx < 0 || rIdx >= repos.length) {
-    console.log("  Invalid selection.");
-    rl.close();
-    return;
-  }
+  if (rIdx < 0 || rIdx >= repos.length) { console.log("  Invalid."); rl.close(); return; }
   const repo = repos[rIdx];
 
-  // ── 2. Select DevHub ────────────────────────────────────────────────────────
   const allOrgs = listOrgs();
-
   if (allOrgs.length === 0) {
-    console.log("\n  No authenticated orgs found.");
-    console.log("  Run: sf org login web --alias <alias>");
+    console.log("\n  No authenticated orgs. Run: sf org login web --alias <alias>");
     rl.close();
     return;
   }
@@ -841,17 +1093,12 @@ async function main(): Promise<void> {
 
   console.log();
   console.log("  Which org is the DevHub for this package?");
-  console.log("  (Must have the Revecast namespace registry attached — Setup → Packages → Namespaces)");
+  console.log("  (Must have the Revecast namespace registry — Setup → Packages → Namespaces)");
 
   const hubIdx = parseInt(await ask("\n  DevHub org #: ")) - 1;
-  if (hubIdx < 0 || hubIdx >= allOrgs.length) {
-    console.log("  Invalid selection.");
-    rl.close();
-    return;
-  }
+  if (hubIdx < 0 || hubIdx >= allOrgs.length) { console.log("  Invalid."); rl.close(); return; }
   const devHub = allOrgs[hubIdx].alias;
 
-  // ── 3. Action loop ──────────────────────────────────────────────────────────
   while (true) {
     console.log();
     console.log("  " + hr());
@@ -859,18 +1106,18 @@ async function main(): Promise<void> {
     console.log("  " + hr());
     console.log();
     console.log("    1. Register new package          first-time setup per sub-package");
-    console.log("    2. Create package version        builds a beta; injects namespace in flows");
+    console.log("    2. Create package version        builds a beta; injects namespace; generates release notes");
     console.log("    3. Promote version to Released   irreversible — enables prod installs");
-    console.log("    4. Install version in org        test a beta in scratch or sandbox");
-    console.log("    5. List all versions             see betas and released in DevHub");
-    console.log("    6. Manage dependencies           set which packages must install first");
+    console.log("    4. Install version in org        test in scratch or sandbox");
+    console.log("    5. List all versions             betas and released in DevHub");
+    console.log("    6. Manage dependencies           set install prerequisites");
     console.log("    7. Exit");
     console.log();
 
     const action = await ask("  Action: ");
 
     try {
-      if (action === "1")      await actionCreatePackage(repo, devHub, repos);
+      if      (action === "1") await actionCreatePackage(repo, devHub, repos);
       else if (action === "2") await actionCreateVersion(repo, devHub);
       else if (action === "3") await actionPromote(repo, devHub);
       else if (action === "4") await actionInstall(repo, allOrgs);

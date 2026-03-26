@@ -1,14 +1,17 @@
 [
   {
     "name": "revecast-recruiter",
-    "path": "~/Documents/revecast-recruiter"
+    "path": "~/Documents/revecast-recruiter",
+    "testOrg": ""
   },
   {
     "name": "revecast-base",
-    "path": "~/Documents/revecast-base"
+    "path": "~/Documents/revecast-base",
+    "testOrg": ""
   },
   {
     "name": "PSACore",
-    "path": "~/Documents/PSACore"
+    "path": "~/Documents/PSACore",
+    "testOrg": ""
   }
 ]
