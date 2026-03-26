@@ -1705,13 +1705,19 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
   const prevAliases = { ...(readProject(repo.path).packageAliases ?? {}) };
 
   // Temporarily remove packageDirectories whose paths don't exist on disk —
-  // sf CLI validates all dirs even when only building one package
-  const currentProj   = readProject(repo.path);
-  const missingDirs   = currentProj.packageDirectories.filter(
+  // sf CLI validates all dirs even when only building one package.
+  // Write a backup first so a hard kill (Ctrl+C) can be recovered from.
+  const sfdxProjectFile   = path.join(repo.path, "sfdx-project.json");
+  const sfdxBackupFile    = path.join(repo.path, ".sfdx-project.json.packaging-backup");
+  const currentProj       = readProject(repo.path);
+  const missingDirs       = currentProj.packageDirectories.filter(
     d => d.path !== pkgDir.path && !fs.existsSync(path.join(repo.path, d.path))
   );
   let removedDirs = false;
   if (missingDirs.length > 0) {
+    // Write backup before touching the file
+    fs.copyFileSync(sfdxProjectFile, sfdxBackupFile);
+
     console.log(`\n  Temporarily removing ${missingDirs.length} packageDirectory entry(ies) whose source is not on this branch:`);
     missingDirs.forEach(d => console.log(`    • ${d.path} (${d.package ?? "unregistered"})`));
     currentProj.packageDirectories = currentProj.packageDirectories.filter(
@@ -1719,6 +1725,11 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
     );
     writeProject(repo.path, currentProj);
     removedDirs = true;
+  } else if (fs.existsSync(sfdxBackupFile)) {
+    // Clean up any leftover backup from a previous interrupted run
+    fs.copyFileSync(sfdxBackupFile, sfdxProjectFile);
+    fs.unlinkSync(sfdxBackupFile);
+    console.log(`  ✓ Restored sfdx-project.json from backup left by previous interrupted run`);
   }
 
   // Namespace injection — Managed only
@@ -1791,10 +1802,9 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
 
   // Restore any packageDirectories that were temporarily removed
   if (removedDirs) {
-    const restored = readProject(repo.path);
-    restored.packageDirectories.push(...missingDirs);
-    writeProject(repo.path, restored);
-    console.log(`  ✓ Restored ${missingDirs.length} temporarily-removed packageDirectory entry(ies)`);
+    fs.copyFileSync(sfdxBackupFile, sfdxProjectFile);
+    fs.unlinkSync(sfdxBackupFile);
+    console.log(`  ✓ Restored sfdx-project.json (${missingDirs.length} packageDirectory entry(ies) added back)`);
   }
 
   if (!success) return;
