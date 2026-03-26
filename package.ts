@@ -58,6 +58,7 @@ interface RepoEntry {
   path: string;
   testOrg?: string;
   oneGPOrg?: string;
+  gitUrl?: string;
 }
 
 interface VersionParts {
@@ -211,9 +212,9 @@ const REPOS_FILE = path.join(__dirname, "repos.json");
  */
 function loadRepos(): RepoEntry[] {
   if (fs.existsSync(REPOS_FILE)) {
-    const raw: { name: string; path: string; testOrg?: string; oneGPOrg?: string }[] =
+    const raw: { name: string; path: string; testOrg?: string; oneGPOrg?: string; gitUrl?: string }[] =
       JSON.parse(fs.readFileSync(REPOS_FILE, "utf8"));
-    return raw.map(r => ({ name: r.name, path: expandHome(r.path), testOrg: r.testOrg, oneGPOrg: r.oneGPOrg }));
+    return raw.map(r => ({ name: r.name, path: expandHome(r.path), testOrg: r.testOrg, oneGPOrg: r.oneGPOrg, gitUrl: r.gitUrl }));
   }
   return discoverAndSaveRepos();
 }
@@ -232,7 +233,9 @@ function discoverRepos(): RepoEntry[] {
     try {
       const proj = JSON.parse(fs.readFileSync(sfdxFile, "utf8"));
       if (Array.isArray(proj.packageDirectories)) {
-        found.push({ name: entry.name, path: repoPath, testOrg: "", oneGPOrg: "" });
+        let gitUrl = "";
+        try { gitUrl = run("git remote get-url origin", repoPath); } catch { /* no remote */ }
+        found.push({ name: entry.name, path: repoPath, testOrg: "", oneGPOrg: "", gitUrl });
       }
     } catch { /* skip malformed */ }
   }
@@ -248,6 +251,7 @@ function saveRepos(repos: RepoEntry[]): void {
       path: r.path,
       testOrg: r.testOrg ?? "",
       oneGPOrg: r.oneGPOrg ?? "",
+      gitUrl: r.gitUrl ?? "",
     })), null, 2) + "\n",
     "utf8"
   );
@@ -1935,20 +1939,27 @@ async function main(): Promise<void> {
     return;
   }
 
-  let repos = loadRepos().filter(r => fs.existsSync(r.path));
-  if (repos.length === 0) {
+  let allRepoEntries = loadRepos();
+  const localRepos   = allRepoEntries.filter(r => fs.existsSync(r.path));
+
+  if (localRepos.length === 0 && allRepoEntries.length === 0) {
     console.log("  No repos found — rescanning ~/Documents...");
-    repos = discoverAndSaveRepos().filter(r => fs.existsSync(r.path));
-    if (repos.length === 0) {
+    allRepoEntries = discoverAndSaveRepos();
+    if (allRepoEntries.length === 0) {
       console.log("  No Salesforce repos found in ~/Documents.");
-      console.log("  Make sure your repos are cloned there, then run again.");
+      console.log("  Clone a repo there first, or run again after cloning.");
       rl.close();
       return;
     }
   }
 
   console.log("  Repos:");
-  repos.forEach((r, i) => {
+  allRepoEntries.forEach((r, i) => {
+    const cloned = fs.existsSync(r.path);
+    if (!cloned) {
+      console.log(`    ${i + 1}. ${r.name.padEnd(24)} (not cloned locally)`);
+      return;
+    }
     const proj     = (() => { try { return readProject(r.path); } catch { return null; } })();
     const pkgCount = proj?.packageDirectories.filter(d => d.package).length ?? 0;
     const total    = proj?.packageDirectories.length ?? 0;
@@ -1960,8 +1971,44 @@ async function main(): Promise<void> {
   });
 
   const rIdx = parseInt(await ask("\n  Select repo: ")) - 1;
-  if (rIdx < 0 || rIdx >= repos.length) { console.log("  Invalid."); rl.close(); return; }
-  const repo = repos[rIdx];
+  if (rIdx < 0 || rIdx >= allRepoEntries.length) { console.log("  Invalid."); rl.close(); return; }
+  let repo = allRepoEntries[rIdx];
+
+  // If selected repo isn't cloned locally, offer to clone it
+  if (!fs.existsSync(repo.path)) {
+    console.log(`\n  "${repo.name}" is not cloned locally.`);
+
+    // Determine the git URL to suggest
+    const defaultOrg = "Revecast";
+    const derivedUrl = `https://github.com/${defaultOrg}/${repo.name}.git`;
+    const suggestedUrl = repo.gitUrl || derivedUrl;
+
+    const urlInput = await ask(`  Git URL to clone from (default: ${suggestedUrl}): `);
+    const cloneUrl = urlInput.trim() || suggestedUrl;
+    const cloneDest = repo.path;
+
+    console.log(`\n  Cloning ${cloneUrl}`);
+    console.log(`  into ${cloneDest}...`);
+    console.log();
+
+    try {
+      runLive(`git clone "${cloneUrl}" "${cloneDest}"`);
+      console.log(`\n  ✓ Cloned to ${cloneDest}`);
+
+      // Save the confirmed gitUrl back to repos.json
+      if (cloneUrl !== repo.gitUrl) {
+        const saved = loadRepos();
+        const entry = saved.find(r => r.name === repo.name);
+        if (entry) { entry.gitUrl = cloneUrl; saveRepos(saved); }
+        repo = { ...repo, gitUrl: cloneUrl };
+      }
+    } catch (err: any) {
+      console.error(`\n  ✗ Clone failed: ${err.message}`);
+      console.log("  Make sure you have access to the repo and try again.");
+      rl.close();
+      return;
+    }
+  }
 
   const allOrgs = listOrgs();
   if (allOrgs.length === 0) {
@@ -2007,12 +2054,12 @@ async function main(): Promise<void> {
     const action = await ask("  Action: ");
 
     try {
-      if      (action === "1") await actionCreatePackage(repo, devHub, repos);
+      if      (action === "1") await actionCreatePackage(repo, devHub, allRepoEntries);
       else if (action === "2") await actionCreateVersion(repo, devHub);
       else if (action === "3") await actionPromote(repo, devHub);
       else if (action === "4") await actionInstall(repo, allOrgs);
       else if (action === "5") await actionListVersions(repo, devHub);
-      else if (action === "6") await actionManageDependencies(repo, repos);
+      else if (action === "6") await actionManageDependencies(repo, allRepoEntries);
       else if (action === "7") await actionShowRegistry();
       else if (action === "8") await actionDeployOneGP(repo, allOrgs);
       else if (action === "9") { console.log("\n  Goodbye.\n"); break; }
