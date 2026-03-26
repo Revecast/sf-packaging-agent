@@ -2087,35 +2087,52 @@ async function main(): Promise<void> {
     }
   }
 
-  // Branch check — packaging should happen from 'develop', not main/master
+  // Branch check — packaging should happen from a dev/feature branch, not main/master
   console.log();
+  const MAIN_BRANCHES = ["main", "master"];
   const PACKAGING_BRANCH = "develop";
   try {
     const currentBranch = run("git rev-parse --abbrev-ref HEAD", repo.path).trim();
-    if (currentBranch === PACKAGING_BRANCH) {
+    if (!MAIN_BRANCHES.includes(currentBranch)) {
       console.log(`  ✓ Branch: ${currentBranch}`);
     } else {
+      // List available non-main branches to help the user pick
+      let remoteBranches: string[] = [];
+      try {
+        remoteBranches = run("git branch -r", repo.path)
+          .split("\n")
+          .map(b => b.trim().replace(/^origin\//, ""))
+          .filter(b => b && b !== "HEAD" && !MAIN_BRANCHES.includes(b) && !b.includes("->"));
+      } catch { /* ignore */ }
+
       console.log(`  ⚠️  Current branch: ${currentBranch}`);
-      console.log(`     Packages should be built from '${PACKAGING_BRANCH}', not '${currentBranch}'.`);
-      const switchAns = await ask(`\n  Switch to '${PACKAGING_BRANCH}'? (Y/n) `);
+      console.log(`     Packages should not be built from '${currentBranch}'.`);
+      if (remoteBranches.length > 0) {
+        console.log(`     Available branches: ${remoteBranches.join(", ")}`);
+      }
+
+      const defaultBranch = remoteBranches.includes(PACKAGING_BRANCH)
+        ? PACKAGING_BRANCH
+        : remoteBranches.find(b => b.startsWith("develop")) ?? remoteBranches[0] ?? PACKAGING_BRANCH;
+
+      const switchAns = await ask(`\n  Switch to '${defaultBranch}'? (Y/n) `);
       if (switchAns.toLowerCase() !== "n") {
         try {
-          run(`git checkout ${PACKAGING_BRANCH}`, repo.path);
-          console.log(`  ✓ Switched to ${PACKAGING_BRANCH}`);
+          run(`git checkout ${defaultBranch}`, repo.path);
+          console.log(`  ✓ Switched to ${defaultBranch}`);
         } catch {
-          // Branch doesn't exist locally — check if it exists on remote or offer to create it
+          // Not local yet — try tracking from remote
           let switched = false;
           try {
-            run(`git checkout -b ${PACKAGING_BRANCH} origin/${PACKAGING_BRANCH}`, repo.path);
-            console.log(`  ✓ Created ${PACKAGING_BRANCH} tracking origin/${PACKAGING_BRANCH}`);
+            run(`git checkout -b ${defaultBranch} origin/${defaultBranch}`, repo.path);
+            console.log(`  ✓ Created ${defaultBranch} tracking origin/${defaultBranch}`);
             switched = true;
           } catch {
-            // No remote branch either — offer to create fresh
-            const createAns = await ask(`  '${PACKAGING_BRANCH}' doesn't exist. Create it from current branch? (Y/n) `);
+            const createAns = await ask(`  '${defaultBranch}' not found locally. Create it from current branch? (Y/n) `);
             if (createAns.toLowerCase() !== "n") {
               try {
-                run(`git checkout -b ${PACKAGING_BRANCH}`, repo.path);
-                console.log(`  ✓ Created and switched to ${PACKAGING_BRANCH}`);
+                run(`git checkout -b ${defaultBranch}`, repo.path);
+                console.log(`  ✓ Created and switched to ${defaultBranch}`);
                 switched = true;
               } catch (e2: any) {
                 console.log(`  ✗ Could not create branch: ${(e2.message ?? "").split("\n")[0]}`);
