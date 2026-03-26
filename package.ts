@@ -2092,6 +2092,9 @@ async function main(): Promise<void> {
   const MAIN_BRANCHES = ["main", "master"];
   const PACKAGING_BRANCH = "develop";
   try {
+    // Fetch so remote branch list is current
+    try { run("git fetch --prune", repo.path); } catch { /* non-fatal */ }
+
     const currentBranch = run("git rev-parse --abbrev-ref HEAD", repo.path).trim();
     if (!MAIN_BRANCHES.includes(currentBranch)) {
       console.log(`  ✓ Branch: ${currentBranch}`);
