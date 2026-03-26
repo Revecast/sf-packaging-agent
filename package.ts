@@ -57,6 +57,7 @@ interface RepoEntry {
   name: string;
   path: string;
   testOrg?: string;
+  oneGPOrg?: string;
 }
 
 interface VersionParts {
@@ -210,9 +211,9 @@ const REPOS_FILE = path.join(__dirname, "repos.json");
  */
 function loadRepos(): RepoEntry[] {
   if (fs.existsSync(REPOS_FILE)) {
-    const raw: { name: string; path: string; testOrg?: string }[] =
+    const raw: { name: string; path: string; testOrg?: string; oneGPOrg?: string }[] =
       JSON.parse(fs.readFileSync(REPOS_FILE, "utf8"));
-    return raw.map(r => ({ name: r.name, path: expandHome(r.path), testOrg: r.testOrg }));
+    return raw.map(r => ({ name: r.name, path: expandHome(r.path), testOrg: r.testOrg, oneGPOrg: r.oneGPOrg }));
   }
   return discoverAndSaveRepos();
 }
@@ -231,7 +232,7 @@ function discoverRepos(): RepoEntry[] {
     try {
       const proj = JSON.parse(fs.readFileSync(sfdxFile, "utf8"));
       if (Array.isArray(proj.packageDirectories)) {
-        found.push({ name: entry.name, path: repoPath, testOrg: "" });
+        found.push({ name: entry.name, path: repoPath, testOrg: "", oneGPOrg: "" });
       }
     } catch { /* skip malformed */ }
   }
@@ -242,7 +243,12 @@ function discoverRepos(): RepoEntry[] {
 function saveRepos(repos: RepoEntry[]): void {
   fs.writeFileSync(
     REPOS_FILE,
-    JSON.stringify(repos.map(r => ({ name: r.name, path: r.path, testOrg: r.testOrg ?? "" })), null, 2) + "\n",
+    JSON.stringify(repos.map(r => ({
+      name: r.name,
+      path: r.path,
+      testOrg: r.testOrg ?? "",
+      oneGPOrg: r.oneGPOrg ?? "",
+    })), null, 2) + "\n",
     "utf8"
   );
 }
@@ -832,6 +838,427 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// ─── 1GP Packaging ─────────────────────────────────────────────────────────
+
+interface ComponentChange {
+  filePath: string;
+  status: "A" | "M" | "D" | "R";
+  componentType: string;
+  componentName: string;
+  mustManuallyAdd: boolean;
+  setupPath: string;
+}
+
+function oneGPTagName(pkgDirPath: string, date: string): string {
+  const dirSlug = pkgDirPath.replace(/\//g, "-").replace(/[^a-zA-Z0-9-]/g, "");
+  return `1gp/${dirSlug}/${date}`;
+}
+
+function getLastOneGPTag(repoPath: string, pkgDirPath: string): string | null {
+  try {
+    const dirSlug = pkgDirPath.replace(/\//g, "-").replace(/[^a-zA-Z0-9-]/g, "");
+    const tags = run(`git tag --list "1gp/${dirSlug}/*" --sort=-creatordate`, repoPath);
+    if (!tags) return null;
+    return tags.split("\n")[0].trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+function tagOneGP(repoPath: string, pkgDirPath: string, date: string): void {
+  const tag = oneGPTagName(pkgDirPath, date);
+  try { run(`git tag ${tag}`, repoPath); } catch { /* tag may already exist */ }
+}
+
+function categorizeComponent(filePath: string, status: "A" | "M" | "D" | "R"): ComponentChange {
+  const mustAdd = status === "A" || status === "R";
+
+  let m: RegExpMatchArray | null;
+
+  // Record types (check before generic object)
+  m = filePath.match(/objects\/([^/]+)\/recordTypes\/([^/]+)\.recordType-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Record Type", componentName: `${m[1]}.${m[2]}`, mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Record Types" };
+
+  // Validation rules
+  m = filePath.match(/objects\/([^/]+)\/validationRules\/([^/]+)\.validationRule-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Validation Rule", componentName: `${m[1]}.${m[2]}`, mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Validation Rules" };
+
+  // Fields
+  m = filePath.match(/objects\/([^/]+)\/fields\/([^/]+)\.field-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Custom Field", componentName: `${m[1]}.${m[2]}`, mustManuallyAdd: mustAdd, setupPath: `Setup → Package Manager → [pkg] → Add → Custom Fields → ${m[1]}` };
+
+  // Object root definition
+  m = filePath.match(/objects\/([^/]+)\/\1\.object-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Custom Object", componentName: m[1], mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Custom Objects" };
+
+  // Apex classes
+  m = filePath.match(/classes\/([^/]+)\.cls$/);
+  if (m) return { filePath, status, componentType: "Apex Class", componentName: m[1], mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Apex Classes" };
+
+  // Apex triggers
+  m = filePath.match(/triggers\/([^/]+)\.trigger$/);
+  if (m) return { filePath, status, componentType: "Apex Trigger", componentName: m[1], mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Apex Triggers" };
+
+  // LWC (multiple files per component — deduplicated by caller)
+  m = filePath.match(/lwc\/([^/]+)\//);
+  if (m) return { filePath, status, componentType: "Lightning Web Component", componentName: m[1], mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Lightning Components" };
+
+  // Aura
+  m = filePath.match(/aura\/([^/]+)\//);
+  if (m) return { filePath, status, componentType: "Aura Component", componentName: m[1], mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Lightning Components" };
+
+  // Flows — always treated as mustManuallyAdd (flows don't auto-include even if modified)
+  m = filePath.match(/flows\/([^/]+)\.flow-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Flow", componentName: m[1], mustManuallyAdd: true, setupPath: "Setup → Package Manager → [pkg] → Add → Flows" };
+
+  // Prompt Templates — always mustManuallyAdd
+  m = filePath.match(/genAiPromptTemplates\/([^/]+)\.genAiPromptTemplate-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Prompt Template", componentName: m[1], mustManuallyAdd: true, setupPath: "Setup → Package Manager → [pkg] → Add → Prompt Templates" };
+  m = filePath.match(/promptTemplates\/([^/]+)\.promptTemplate-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Prompt Template", componentName: m[1], mustManuallyAdd: true, setupPath: "Setup → Package Manager → [pkg] → Add → Prompt Templates" };
+
+  // Permission Sets
+  m = filePath.match(/permissionsets\/([^/]+)\.permissionset-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Permission Set", componentName: m[1], mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Permission Sets" };
+
+  // Page Layouts
+  m = filePath.match(/layouts\/([^/]+)\.layout-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Page Layout", componentName: m[1], mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Page Layouts" };
+
+  // Custom Metadata records
+  m = filePath.match(/customMetadata\/([^/]+)\.md-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Custom Metadata Record", componentName: m[1], mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Custom Metadata" };
+
+  // Static Resources
+  m = filePath.match(/staticresources\/([^/]+)\./);
+  if (m) return { filePath, status, componentType: "Static Resource", componentName: m[1], mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Static Resources" };
+
+  // Custom Tabs
+  m = filePath.match(/tabs\/([^/]+)\.tab-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Custom Tab", componentName: m[1], mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Custom Tabs" };
+
+  // Report Types
+  m = filePath.match(/reportTypes\/([^/]+)\.reportType-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Report Type", componentName: m[1], mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Report Types" };
+
+  // Email Templates
+  m = filePath.match(/email\/(.+)\.email-meta\.xml$/);
+  if (m) return { filePath, status, componentType: "Email Template", componentName: m[1], mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → Email Templates" };
+
+  // Fallback
+  const parts = filePath.split("/");
+  const name = parts[parts.length - 1].replace(/\.[^.]+$/, "").replace(/\.[^.]+$/, "");
+  return { filePath, status, componentType: "Metadata", componentName: name, mustManuallyAdd: mustAdd, setupPath: "Setup → Package Manager → [pkg] → Add → [appropriate type]" };
+}
+
+/**
+ * Get all changed/new metadata files in a package dir since the last 1GP tag.
+ * If no prior tag, returns all tracked files (first-time packaging).
+ */
+function getChangedComponents(repoPath: string, pkgDirPath: string, sinceTag: string | null): ComponentChange[] {
+  const seen = new Set<string>();
+  const components: ComponentChange[] = [];
+
+  const addComp = (filePath: string, status: "A" | "M" | "D" | "R") => {
+    const comp = categorizeComponent(filePath, status);
+    const key = `${comp.componentType}::${comp.componentName}`;
+    if (!seen.has(key)) { seen.add(key); components.push(comp); }
+  };
+
+  try {
+    if (sinceTag) {
+      const raw = run(`git diff "${sinceTag}"..HEAD --name-status -- ${pkgDirPath}`, repoPath);
+      if (!raw) return [];
+      for (const line of raw.split("\n").filter(Boolean)) {
+        const parts = line.split("\t");
+        const rawStatus = (parts[0]?.charAt(0) ?? "M") as "A" | "M" | "D" | "R";
+        const filePath  = parts[parts.length - 1]?.trim() ?? "";
+        if (filePath) addComp(filePath, rawStatus);
+      }
+    } else {
+      // No prior 1GP tag — list all tracked files as "new"
+      const raw = run(`git ls-files -- ${pkgDirPath}`, repoPath);
+      if (!raw) return [];
+      for (const filePath of raw.split("\n").filter(Boolean)) {
+        addComp(filePath.trim(), "A");
+      }
+    }
+  } catch { /* non-fatal */ }
+
+  return components;
+}
+
+function buildOneGPChecklist(
+  components: ComponentChange[],
+  pkgName: string,
+  deployedOrg: string,
+  sinceTag: string | null,
+  date: string
+): string {
+  const mustAdd      = components.filter(c => c.mustManuallyAdd && c.status !== "D");
+  const autoIncluded = components.filter(c => !c.mustManuallyAdd && c.status === "M");
+  const deleted      = components.filter(c => c.status === "D");
+
+  const lines: string[] = [];
+  lines.push(`# 1GP Packaging Checklist — ${pkgName}`);
+  lines.push(`Generated: ${date}  |  Deployed to: \`${deployedOrg}\``);
+  lines.push(sinceTag ? `Changes since: \`${sinceTag}\`` : "Changes: all tracked files (no prior 1GP deploy tag found — first packaging run)");
+  lines.push("");
+  lines.push("---");
+  lines.push("");
+
+  // ── New components: must add manually ─────────────────────────────────────
+  if (mustAdd.length > 0) {
+    lines.push("## ⚠️  NEW Components — Must Add to Package Manager");
+    lines.push("");
+    lines.push("These are new since the last 1GP deploy and must be manually added.");
+    lines.push("Group them by the Setup path below, then add each one.");
+    lines.push("");
+
+    // Group by setupPath for cleaner navigation
+    const byPath = new Map<string, ComponentChange[]>();
+    for (const c of mustAdd) {
+      if (!byPath.has(c.setupPath)) byPath.set(c.setupPath, []);
+      byPath.get(c.setupPath)!.push(c);
+    }
+
+    for (const [setupPath, comps] of byPath) {
+      lines.push(`### ${setupPath}`);
+      lines.push("");
+      for (const c of comps) {
+        lines.push(`- [ ] **${c.componentType}:** \`${c.componentName}\``);
+      }
+      lines.push("");
+    }
+  } else {
+    lines.push("## ✅  No New Components");
+    lines.push("All changed components are already in the package.");
+    lines.push("");
+  }
+
+  // ── Modified components: auto-included ────────────────────────────────────
+  if (autoIncluded.length > 0) {
+    lines.push("## ✅  Modified Components — Auto-Included on Next Package Upload");
+    lines.push("");
+    lines.push("Already in the package — changes will be picked up automatically when you upload.");
+    lines.push("");
+    for (const c of autoIncluded) {
+      lines.push(`- ${c.componentType}: \`${c.componentName}\``);
+    }
+    lines.push("");
+  }
+
+  // ── Deleted components ────────────────────────────────────────────────────
+  if (deleted.length > 0) {
+    lines.push("## 🗑️  Deleted Components — Review Required");
+    lines.push("");
+    lines.push("Removed from source. Determine if they should also be removed from the package.");
+    lines.push("Note: 1GP packages cannot remove components once included in a Released version.");
+    lines.push("");
+    for (const c of deleted) {
+      lines.push(`- [ ] ${c.componentType}: \`${c.componentName}\``);
+    }
+    lines.push("");
+  }
+
+  // ── Manual configuration review ───────────────────────────────────────────
+  lines.push("## 🔍  Manual Configuration Review");
+  lines.push("");
+  lines.push("Review any configurations made manually in your validation org that are NOT in source.");
+  lines.push("These are NOT captured by git diff and will NOT be in the package automatically.");
+  lines.push("For each item below, verify it is either in source (committed) or handled separately.");
+  lines.push("");
+  lines.push("### Org configurations to check");
+  lines.push("");
+  lines.push("- [ ] **Page Layout assignments to Profiles/Record Types** — Configured in Setup? Retrieve with:");
+  lines.push("      `sf project retrieve start -m Layout -o <yourOrg>` then commit");
+  lines.push("- [ ] **Permission Set field/object access** — New fields/objects need explicit permissions in");
+  lines.push("      `.permissionset-meta.xml`. Retrieve and verify.");
+  lines.push("- [ ] **Flow activation state** — Flows deployed as inactive by default. Verify activation");
+  lines.push("      status matches what you validated. Active flows must be activated post-install by customer.");
+  lines.push("- [ ] **Custom Settings default values** — Values set via Setup → Custom Settings are NOT packaged.");
+  lines.push("      Document any required values in your post-install guide.");
+  lines.push("- [ ] **Quick Action placements on Page Layouts** — Verify layout XML captures these.");
+  lines.push("- [ ] **List View visibility / sharing** — List views configured manually in org may not be in source.");
+  lines.push("- [ ] **Connected App / Auth Provider config** — Org-specific, not included in packages.");
+  lines.push("      Document for customer post-install setup.");
+  lines.push("- [ ] **Any other Setup config made in jfcdev since last install** — Walk through recent changes");
+  lines.push("      in Setup Audit Trail (Setup → Security → View Setup Audit Trail) to identify anything missed.");
+  lines.push("");
+
+  // ── Next steps ────────────────────────────────────────────────────────────
+  lines.push("## 📦  Next Steps: Upload Package Version in Setup");
+  lines.push("");
+  lines.push(`1. In org **\`${deployedOrg}\`** → **Setup → Package Manager**`);
+  lines.push("2. Open your package and verify all new components above are added");
+  lines.push("3. Click **Upload** to create a new package version");
+  lines.push("4. Set version number, release notes, and password (if applicable)");
+  lines.push("5. After upload completes, copy the install link and share with customers");
+  lines.push("");
+
+  return lines.join("\n");
+}
+
+function writeOneGPChecklist(repoPath: string, pkgDirPath: string, date: string, checklist: string): string {
+  const docsDir = path.join(repoPath, "docs");
+  if (!fs.existsSync(docsDir)) fs.mkdirSync(docsDir, { recursive: true });
+  const dirSlug = pkgDirPath.replace(/\//g, "-").replace(/[^a-zA-Z0-9-]/g, "");
+  const file = path.join(docsDir, `1gp-checklist-${dirSlug}-${date}.md`);
+  fs.writeFileSync(file, checklist, "utf8");
+  return file;
+}
+
+async function actionDeployOneGP(repo: RepoEntry, allOrgs: OrgInfo[]): Promise<void> {
+  const proj    = readProject(repo.path);
+  const pkgDirs = proj.packageDirectories;
+
+  if (pkgDirs.length === 0) {
+    console.log("\n  No package directories found.");
+    return;
+  }
+
+  // Select sub-package(s)
+  console.log("\n  Select sub-package to deploy to 1GP org:");
+  pkgDirs.forEach((d, i) => {
+    const label = d.package ? `${d.path}  (${d.package})` : d.path;
+    console.log(`    ${i + 1}. ${label}`);
+  });
+  console.log(`    ${pkgDirs.length + 1}. Deploy ALL`);
+
+  const idx = parseInt(await ask("\n  Which? ")) - 1;
+  if (idx < 0 || idx > pkgDirs.length) { console.log("  Cancelled."); return; }
+  const selectedDirs = idx === pkgDirs.length ? pkgDirs : [pkgDirs[idx]];
+
+  // Resolve target org
+  let targetOrg = repo.oneGPOrg ?? "";
+
+  if (!targetOrg) {
+    const targetOrgs = allOrgs.filter(o => !o.isDevHub);
+    if (targetOrgs.length === 0) { console.log("  No target orgs found."); return; }
+
+    console.log("\n  1GP packaging org (e.g. jfcdev):");
+    targetOrgs.forEach((o, i) => {
+      const type = o.isSandbox ? "Sandbox" : "Dev/Scratch";
+      console.log(`    ${i + 1}. ${o.alias}  (${type})`);
+    });
+
+    const oIdx = parseInt(await ask("\n  Deploy to which org? ")) - 1;
+    if (oIdx < 0 || oIdx >= targetOrgs.length) { console.log("  Cancelled."); return; }
+    targetOrg = targetOrgs[oIdx].alias;
+
+    const saveOrg = await ask(`\n  Save "${targetOrg}" as default 1GP org for ${repo.name}? (Y/n) `);
+    if (saveOrg.toLowerCase() !== "n") {
+      const allRepos = loadRepos();
+      const entry    = allRepos.find(r => r.path === repo.path || r.path === expandHome(repo.path));
+      if (entry) {
+        entry.oneGPOrg = targetOrg;
+        saveRepos(allRepos);
+        repo.oneGPOrg = targetOrg;
+        console.log("  ✓ Saved to repos.json");
+      }
+    }
+  } else {
+    console.log(`\n  Using configured 1GP org: ${targetOrg}`);
+  }
+
+  // Warn uncommitted changes
+  for (const dir of selectedDirs) {
+    warnUncommittedChanges(repo.path, dir.path);
+  }
+
+  // Show namespace injection preview
+  let anyInjection = false;
+  for (const dir of selectedDirs) {
+    const preview = previewInjection(path.join(repo.path, dir.path));
+    if (preview.length > 0) {
+      if (!anyInjection) console.log();
+      anyInjection = true;
+      console.log(`  Namespace injection for ${dir.path}:`);
+      preview.forEach(({ file, additions }) => console.log(`    ${file}  (+${additions})`));
+    }
+  }
+  if (!anyInjection) console.log("\n  No namespace injection needed.");
+
+  console.log();
+  console.log("  " + hr());
+  console.log(`  Repo:   ${repo.name}`);
+  console.log(`  Dirs:   ${selectedDirs.map(d => d.path).join(", ")}`);
+  console.log(`  Target: ${targetOrg}`);
+  console.log("  " + hr());
+
+  const go = await ask("\n  Proceed? (Y/n) ");
+  if (go.toLowerCase() === "n") { console.log("  Cancelled."); return; }
+
+  const today = new Date().toISOString().split("T")[0];
+  let deploySuccess = true;
+
+  // Deploy each selected directory
+  for (const dir of selectedDirs) {
+    const sourceDir = path.join(repo.path, dir.path);
+    const backups   = injectAll(sourceDir);
+    if (backups.size > 0) console.log(`\n  ✓ Namespace injected into ${backups.size} file(s) in ${dir.path}`);
+
+    console.log(`\n  Deploying ${dir.path} → ${targetOrg}...`);
+    console.log();
+
+    try {
+      runLive(
+        `sf project deploy start --source-dir "${sourceDir}" --target-org ${targetOrg} --wait 30`,
+        repo.path
+      );
+      console.log(`\n  ✓ Deployed ${dir.path}`);
+    } catch (err: any) {
+      console.error(`\n  ✗ Deploy failed for ${dir.path}:\n  ${err.message ?? ""}`);
+      deploySuccess = false;
+    }
+
+    // Always revert namespace injection
+    if (backups.size > 0) {
+      revertAll(backups);
+      console.log(`  ✓ Namespace injection reverted`);
+    }
+  }
+
+  if (!deploySuccess) {
+    console.log("\n  Deploy failed — fix the errors above before generating the Package Manager checklist.");
+    return;
+  }
+
+  // Generate and write checklist for each deployed directory
+  console.log();
+  for (const dir of selectedDirs) {
+    const sinceTag  = getLastOneGPTag(repo.path, dir.path);
+    const components = getChangedComponents(repo.path, dir.path, sinceTag);
+    const pkgName   = dir.package ?? dir.path;
+
+    const checklist     = buildOneGPChecklist(components, pkgName, targetOrg, sinceTag, today);
+    const checklistPath = writeOneGPChecklist(repo.path, dir.path, today, checklist);
+
+    console.log(`  ✓ Checklist written → ${path.relative(repo.path, checklistPath)}`);
+
+    const mustAdd = components.filter(c => c.mustManuallyAdd && c.status !== "D");
+    if (mustAdd.length > 0) {
+      console.log(`\n  ⚠️  ${mustAdd.length} component(s) must be manually added to Package Manager:`);
+      mustAdd.slice(0, 12).forEach(c => console.log(`    • ${c.componentType}: ${c.componentName}`));
+      if (mustAdd.length > 12) console.log(`    ... and ${mustAdd.length - 12} more (see checklist)`);
+    } else {
+      console.log("  ✓ No new components — all changes auto-included on next package upload");
+    }
+
+    // Tag the product repo to mark this 1GP deploy
+    try {
+      tagOneGP(repo.path, dir.path, today);
+      console.log(`\n  ✓ Tagged: ${oneGPTagName(dir.path, today)}`);
+    } catch { /* non-fatal */ }
+  }
+
+  console.log();
+  console.log("  " + hr());
+  console.log(`  Next: open Setup → Package Manager in ${targetOrg}`);
+  console.log("  Add all new components from the checklist, then click Upload.");
+  console.log("  " + hr());
+}
+
 // ─── Actions ─────────────────────────────────────────────────────────────────
 
 async function promptDependencies(
@@ -1407,7 +1834,8 @@ async function main(): Promise<void> {
     console.log("    5. List all versions             betas and released in DevHub");
     console.log("    6. Manage dependencies           set install prerequisites");
     console.log("    7. Version registry              all versions created, with install URLs and keys");
-    console.log("    8. Exit");
+    console.log("    8. Deploy to 1GP packaging org   deploy + namespace-inject + generate Package Manager checklist");
+    console.log("    9. Exit");
     console.log();
 
     const action = await ask("  Action: ");
@@ -1420,7 +1848,8 @@ async function main(): Promise<void> {
       else if (action === "5") await actionListVersions(repo, devHub);
       else if (action === "6") await actionManageDependencies(repo, repos);
       else if (action === "7") await actionShowRegistry();
-      else if (action === "8") { console.log("\n  Goodbye.\n"); break; }
+      else if (action === "8") await actionDeployOneGP(repo, allOrgs);
+      else if (action === "9") { console.log("\n  Goodbye.\n"); break; }
       else console.log("  Invalid selection.");
     } catch (err: any) {
       console.error(`\n  Error: ${err.message}`);
