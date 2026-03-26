@@ -2087,8 +2087,31 @@ async function main(): Promise<void> {
     }
   }
 
-  // Auto-pull latest changes before doing anything
+  // Branch check — packaging should happen from 'develop', not main/master
   console.log();
+  const PACKAGING_BRANCH = "develop";
+  try {
+    const currentBranch = run("git rev-parse --abbrev-ref HEAD", repo.path).trim();
+    if (currentBranch === PACKAGING_BRANCH) {
+      console.log(`  ✓ Branch: ${currentBranch}`);
+    } else {
+      console.log(`  ⚠️  Current branch: ${currentBranch}`);
+      console.log(`     Packages should be built from '${PACKAGING_BRANCH}', not '${currentBranch}'.`);
+      const switchAns = await ask(`\n  Switch to '${PACKAGING_BRANCH}'? (Y/n) `);
+      if (switchAns.toLowerCase() !== "n") {
+        try {
+          run(`git checkout ${PACKAGING_BRANCH}`, repo.path);
+          console.log(`  ✓ Switched to ${PACKAGING_BRANCH}`);
+        } catch (e: any) {
+          console.log(`  ✗ Could not switch: ${(e.message ?? "").split("\n")[0]}`);
+          const cont = await ask("  Continue on current branch anyway? (y/N) ");
+          if (cont.toLowerCase() !== "y") { rl.close(); return; }
+        }
+      }
+    }
+  } catch { /* non-fatal — no git repo or other issue */ }
+
+  // Auto-pull latest changes
   try {
     const pullOut = run("git pull --ff-only", repo.path);
     if (pullOut.includes("Already up to date") || pullOut.includes("up to date")) {
@@ -2098,7 +2121,6 @@ async function main(): Promise<void> {
       pullOut.split("\n").filter(Boolean).forEach(l => console.log(`    ${l}`));
     }
   } catch (err: any) {
-    // Non-fatal — warn but continue (e.g. detached HEAD, merge conflict, no remote)
     console.log(`  ⚠️  git pull failed — continuing with local state`);
     console.log(`     ${(err.message ?? "").split("\n")[0]}`);
   }
