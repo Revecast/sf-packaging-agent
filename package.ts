@@ -37,6 +37,7 @@ interface PackageDependency {
 interface PackageDir {
   path: string;
   package?: string;
+  packageType?: "Managed" | "Unlocked";
   versionName?: string;
   versionNumber?: string;
   versionDescription?: string;
@@ -1514,6 +1515,32 @@ async function actionManageDependencies(repo: RepoEntry, allRepos: RepoEntry[]):
   else console.log("  (none)");
 }
 
+/**
+ * Look up the package type (Managed/Unlocked) for a package name from the DevHub.
+ * Falls back to checking packageDir.packageType stored in sfdx-project.json.
+ */
+function getPackageType(pkgName: string, devHub: string, repoPath: string): "Managed" | "Unlocked" {
+  // Check sfdx-project.json first (stored during registration)
+  try {
+    const proj = readProject(repoPath);
+    const dir  = proj.packageDirectories.find(d => d.package === pkgName);
+    if (dir?.packageType) return dir.packageType;
+  } catch { /* fall through */ }
+
+  // Query DevHub
+  try {
+    const raw  = run(`sf package list --target-dev-hub ${devHub} --json`, repoPath);
+    const data = JSON.parse(raw);
+    const pkg  = (data.result ?? []).find((p: any) =>
+      p.Name === pkgName || p.Package2?.Name === pkgName
+    );
+    if (pkg?.ContainerOptions === "Managed" || pkg?.Package2?.ContainerOptions === "Managed") return "Managed";
+    if (pkg) return "Unlocked";
+  } catch { /* fall through */ }
+
+  return "Managed"; // safe default
+}
+
 async function actionCreatePackage(repo: RepoEntry, devHub: string, allRepos: RepoEntry[]): Promise<void> {
   const proj        = readProject(repo.path);
   const unregistered = proj.packageDirectories.filter(d => !d.package);
@@ -1522,7 +1549,10 @@ async function actionCreatePackage(repo: RepoEntry, devHub: string, allRepos: Re
   console.log();
   if (registered.length > 0) {
     console.log("  Already registered:");
-    registered.forEach(d => console.log(`    • ${d.path}  →  ${d.package}`));
+    registered.forEach(d => {
+      const typeLabel = d.packageType ? `  [${d.packageType}]` : "";
+      console.log(`    • ${d.path}  →  ${d.package}${typeLabel}`);
+    });
     console.log();
   }
   if (unregistered.length === 0) { console.log("  All directories already registered."); return; }
@@ -1538,9 +1568,16 @@ async function actionCreatePackage(repo: RepoEntry, devHub: string, allRepos: Re
   const pkgName     = await ask(`  Package name (default: ${defaultName}): `) || defaultName;
 
   console.log();
+  console.log("  Package type:");
+  console.log("    1. Managed   — namespace-prefixed, upgradeable, code is protected (default for Revecast)");
+  console.log("    2. Unlocked  — no namespace, components editable by installer, upgradeable");
+  const typeChoice  = await ask("\n  Type (default: 1): ");
+  const pkgType: "Managed" | "Unlocked" = typeChoice.trim() === "2" ? "Unlocked" : "Managed";
+
+  console.log();
   try {
     runLive(
-      `sf package create --name "${pkgName}" --package-type Managed --path ${dir.path} --target-dev-hub ${devHub}`,
+      `sf package create --name "${pkgName}" --package-type ${pkgType} --path ${dir.path} --target-dev-hub ${devHub}`,
       repo.path
     );
 
@@ -1548,12 +1585,17 @@ async function actionCreatePackage(repo: RepoEntry, devHub: string, allRepos: Re
     const entry   = updated.packageDirectories.find(d => d.path === dir.path);
     if (entry && !entry.package) {
       entry.package       = pkgName;
+      entry.packageType   = pkgType;
       entry.versionName   = "ver 1.0";
       entry.versionNumber = "1.0.0.NEXT";
       writeProject(repo.path, updated);
     }
 
-    console.log(`\n  ✓ "${pkgName}" registered. sfdx-project.json updated.`);
+    console.log(`\n  ✓ "${pkgName}" registered as ${pkgType}. sfdx-project.json updated.`);
+
+    if (pkgType === "Unlocked") {
+      console.log("  Note: Unlocked packages do not require a namespace or installation key.");
+    }
 
     const addDeps = await ask("\n  Configure dependencies now? (Y/n) ");
     if (addDeps.toLowerCase() !== "n") {
@@ -1596,8 +1638,18 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
   const newVersion     = await promptVersionBump(currentVersion);
   const versionShort   = versionLabel(newVersion);
 
-  const keyInput   = await ask(`\n  Installation key (default: ${DEFAULT_INSTALL_KEY}): `);
-  const installKey = keyInput || DEFAULT_INSTALL_KEY;
+  // Determine package type — Unlocked packages skip namespace injection and don't need an install key
+  const pkgType = getPackageType(pkgDir.package!, devHub, repo.path);
+  const isUnlocked = pkgType === "Unlocked";
+
+  let installKey = "";
+  if (isUnlocked) {
+    const keyInput = await ask(`\n  Installation key (leave blank for none — Unlocked packages don't require one): `);
+    installKey = keyInput.trim();
+  } else {
+    const keyInput = await ask(`\n  Installation key (default: ${DEFAULT_INSTALL_KEY}): `);
+    installKey = keyInput || DEFAULT_INSTALL_KEY;
+  }
 
   const description = await ask("  Version description (optional): ");
 
@@ -1606,10 +1658,13 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
   // Warn about uncommitted changes — they won't be in the package
   warnUncommittedChanges(repo.path, pkgDir.path);
 
-  const preview   = previewInjection(sourceDir);
+  // Namespace injection only applies to Managed packages
+  const preview = isUnlocked ? [] : previewInjection(sourceDir);
 
   console.log();
-  if (preview.length > 0) {
+  if (isUnlocked) {
+    console.log("  Unlocked package — namespace injection skipped.");
+  } else if (preview.length > 0) {
     console.log(`  Namespace injection (${NAMESPACE}__ added before create, reverted after):`);
     preview.forEach(({ file, additions }) => console.log(`    ${file}  (+${additions})`));
   } else {
@@ -1617,16 +1672,18 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
   }
 
   // Find previous tag for release notes scoping
-  const prevTag     = getLastVersionTag(repo.path, pkgDir.path);
+  const prevTag      = getLastVersionTag(repo.path, pkgDir.path);
   const hadNamespace = !!proj.namespace;
 
   console.log();
   console.log("  " + hr());
-  console.log(`  Package:        ${pkgDir.package}`);
+  console.log(`  Package:        ${pkgDir.package}  [${pkgType}]`);
   console.log(`  Version:        ${versionShort}`);
-  console.log(`  Install key:    ${installKey}`);
+  console.log(`  Install key:    ${installKey || "(none)"}`);
   console.log(`  DevHub:         ${devHub}`);
-  console.log(`  Namespace:      ${hadNamespace ? "already set" : "temporarily added"}`);
+  if (!isUnlocked) {
+    console.log(`  Namespace:      ${hadNamespace ? "already set" : "temporarily added"}`);
+  }
   console.log(`  Prev tag:       ${prevTag ?? "none (first version — all commits included)"}`);
   if (repo.testOrg) {
     console.log(`  Auto-install:   ${repo.testOrg} (from repos.json)`);
@@ -1636,25 +1693,25 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
   const go = await ask("\n  Proceed? (Y/n) ");
   if (go.toLowerCase() === "n") { console.log("  Cancelled."); return; }
 
-  // Update sfdx-project.json with new version + temp namespace
+  // Update sfdx-project.json with new version; only add temp namespace for Managed
   const workProj = readProject(repo.path);
   const workDir  = workProj.packageDirectories.find(d => d.path === pkgDir.path)!;
   workDir.versionNumber = newVersion;
   if (description) workDir.versionDescription = description;
-  if (!workProj.namespace) workProj.namespace = NAMESPACE;
+  if (!isUnlocked && !workProj.namespace) workProj.namespace = NAMESPACE;
   writeProject(repo.path, workProj);
 
   // Snapshot aliases before version create so we can find the new one
   const prevAliases = { ...(readProject(repo.path).packageAliases ?? {}) };
 
-  // Namespace injection
-  const backups = injectAll(sourceDir);
+  // Namespace injection — Managed only
+  const backups = isUnlocked ? new Map<string, string>() : injectAll(sourceDir);
   if (backups.size > 0) console.log(`\n  ✓ Namespace injected into ${backups.size} file(s)`);
 
   const args = [
     `sf package version create`,
     `--package "${pkgDir.package}"`,
-    `--installation-key ${installKey}`,
+    installKey ? `--installation-key ${installKey}` : `--installation-key-bypass`,
     `--wait 60`,
     `--target-dev-hub ${devHub}`,
   ];
@@ -1703,12 +1760,12 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
     console.log("  • Component exists in multiple package directories");
   }
 
-  // Always revert namespace
+  // Always revert namespace (Managed only — Unlocked has no backups/namespace)
   if (backups.size > 0) {
     revertAll(backups);
     console.log(`\n  ✓ Namespace injection reverted`);
   }
-  if (!hadNamespace) {
+  if (!isUnlocked && !hadNamespace) {
     const clean = readProject(repo.path);
     delete clean.namespace;
     writeProject(repo.path, clean);
