@@ -1969,42 +1969,62 @@ async function main(): Promise<void> {
     const testTag  = r.testOrg ? `  [test: ${r.testOrg}]` : "";
     console.log(`    ${i + 1}. ${r.name.padEnd(24)} ${status}${testTag}`);
   });
+  const addIdx = allRepoEntries.length + 1;
+  console.log(`    ${addIdx}. Clone a new repo...`);
 
   const rIdx = parseInt(await ask("\n  Select repo: ")) - 1;
-  if (rIdx < 0 || rIdx >= allRepoEntries.length) { console.log("  Invalid."); rl.close(); return; }
-  let repo = allRepoEntries[rIdx];
+  if (rIdx < 0 || rIdx > allRepoEntries.length) { console.log("  Invalid."); rl.close(); return; }
 
-  // If selected repo isn't cloned locally, offer to clone it
-  if (!fs.existsSync(repo.path)) {
-    console.log(`\n  "${repo.name}" is not cloned locally.`);
+  // ── Clone a new repo ──────────────────────────────────────────────────────
+  if (rIdx === allRepoEntries.length) {
+    const urlInput  = await ask("\n  Git URL (e.g. https://github.com/Revecast/my-repo.git): ");
+    const cloneUrl  = urlInput.trim();
+    if (!cloneUrl) { console.log("  Cancelled."); rl.close(); return; }
 
-    // Determine the git URL to suggest
-    const defaultOrg = "Revecast";
-    const derivedUrl = `https://github.com/${defaultOrg}/${repo.name}.git`;
-    const suggestedUrl = repo.gitUrl || derivedUrl;
+    // Derive name from URL (last path segment, strip .git)
+    const inferredName = cloneUrl.split("/").pop()?.replace(/\.git$/, "") ?? "new-repo";
+    const nameInput    = await ask(`  Local folder name (default: ${inferredName}): `);
+    const repoName     = nameInput.trim() || inferredName;
+    const cloneDest    = expandHome(`~/Documents/${repoName}`);
 
-    const urlInput = await ask(`  Git URL to clone from (default: ${suggestedUrl}): `);
-    const cloneUrl = urlInput.trim() || suggestedUrl;
-    const cloneDest = repo.path;
-
-    console.log(`\n  Cloning ${cloneUrl}`);
-    console.log(`  into ${cloneDest}...`);
+    console.log(`\n  Cloning into ${cloneDest}...`);
     console.log();
-
     try {
       runLive(`git clone "${cloneUrl}" "${cloneDest}"`);
-      console.log(`\n  ✓ Cloned to ${cloneDest}`);
-
-      // Save the confirmed gitUrl back to repos.json
-      if (cloneUrl !== repo.gitUrl) {
-        const saved = loadRepos();
-        const entry = saved.find(r => r.name === repo.name);
-        if (entry) { entry.gitUrl = cloneUrl; saveRepos(saved); }
-        repo = { ...repo, gitUrl: cloneUrl };
-      }
+      console.log(`\n  ✓ Cloned`);
     } catch (err: any) {
       console.error(`\n  ✗ Clone failed: ${err.message}`);
-      console.log("  Make sure you have access to the repo and try again.");
+      rl.close();
+      return;
+    }
+
+    const newEntry: RepoEntry = { name: repoName, path: cloneDest, testOrg: "", oneGPOrg: "", gitUrl: cloneUrl };
+    allRepoEntries.push(newEntry);
+    saveRepos(allRepoEntries);
+    console.log(`  ✓ Added to repos.json`);
+  }
+
+  let repo = allRepoEntries[rIdx];
+
+  // If a known repo isn't cloned locally, offer to clone it now
+  if (!fs.existsSync(repo.path)) {
+    console.log(`\n  "${repo.name}" is not cloned locally.`);
+    const defaultUrl   = `https://github.com/Revecast/${repo.name}.git`;
+    const suggestedUrl = repo.gitUrl || defaultUrl;
+    const urlInput     = await ask(`  Git URL (default: ${suggestedUrl}): `);
+    const cloneUrl     = urlInput.trim() || suggestedUrl;
+
+    console.log(`\n  Cloning into ${repo.path}...`);
+    console.log();
+    try {
+      runLive(`git clone "${cloneUrl}" "${repo.path}"`);
+      console.log(`\n  ✓ Cloned`);
+      const saved  = loadRepos();
+      const entry  = saved.find(r => r.name === repo.name);
+      if (entry) { entry.gitUrl = cloneUrl; saveRepos(saved); }
+      repo = { ...repo, gitUrl: cloneUrl };
+    } catch (err: any) {
+      console.error(`\n  ✗ Clone failed: ${err.message}`);
       rl.close();
       return;
     }
