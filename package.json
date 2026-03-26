@@ -1,0 +1,17 @@
+{
+  "name": "sf-packaging-agent",
+  "version": "1.0.0",
+  "description": "Revecast 2GP managed package CLI",
+  "main": "index.js",
+  "scripts": {
+    "start": "npx tsx package.ts"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0"
+  }
+}
