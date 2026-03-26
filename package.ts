@@ -988,12 +988,138 @@ function getChangedComponents(repoPath: string, pkgDirPath: string, sinceTag: st
   return components;
 }
 
+/**
+ * Derive specific, named manual configuration tasks from the component changes.
+ * Returns actionable checklist items rather than generic reminders.
+ */
+function deriveConfigItems(components: ComponentChange[]): string[] {
+  const items: string[] = [];
+
+  const ofType = (type: string, mustAdd?: boolean) =>
+    components.filter(c =>
+      c.componentType === type &&
+      c.status !== "D" &&
+      (mustAdd === undefined || c.mustManuallyAdd === mustAdd)
+    );
+
+  const newFields       = ofType("Custom Field",            true);
+  const newObjects      = ofType("Custom Object",           true);
+  const allFlows        = ofType("Flow");
+  const newLayouts      = ofType("Page Layout",             true);
+  const newRecordTypes  = ofType("Record Type",             true);
+  const newTabs         = ofType("Custom Tab",              true);
+  const newPermSets     = ofType("Permission Set",          true);
+  const newLWC          = [...ofType("Lightning Web Component", true), ...ofType("Aura Component", true)];
+  const newPromptTpls   = ofType("Prompt Template");
+  const modPermSets     = ofType("Permission Set",          false);
+
+  if (newObjects.length > 0) {
+    items.push("**Object Permissions** — New objects must have CRUD access added to Permission Sets:");
+    for (const c of newObjects) {
+      items.push(`  - [ ] \`${c.componentName}\` — add Read / Create / Edit / Delete as appropriate to relevant Permission Sets`);
+    }
+  }
+
+  if (newFields.length > 0) {
+    items.push("**Field-Level Security** — New fields need explicit Read/Edit access in Permission Sets:");
+    const byObj = new Map<string, string[]>();
+    for (const c of newFields) {
+      const [obj, field] = c.componentName.split(".");
+      if (!byObj.has(obj)) byObj.set(obj, []);
+      byObj.get(obj)!.push(field ?? c.componentName);
+    }
+    for (const [obj, fields] of byObj) {
+      items.push(`  - [ ] \`${obj}\` — fields: ${fields.map(f => `\`${f}\``).join(", ")}`);
+      items.push(`        → Object Manager → ${obj} → Fields & Relationships → each field → Set FLS`);
+      items.push(`        → Or retrieve updated permission set: \`sf project retrieve start -m PermissionSet -o <yourOrg>\``);
+    }
+  }
+
+  if (newLayouts.length > 0) {
+    items.push("**Page Layout Assignments** — New layouts need to be assigned to Profiles / Record Types:");
+    for (const c of newLayouts) {
+      const obj = c.componentName.split("-")[0];
+      items.push(`  - [ ] \`${c.componentName}\` → Object Manager → ${obj} → Page Layout Assignment`);
+    }
+  }
+
+  if (newRecordTypes.length > 0) {
+    items.push("**Record Type Visibility** — New record types need Profile/Permission Set access:");
+    for (const c of newRecordTypes) {
+      items.push(`  - [ ] \`${c.componentName}\` — add to relevant Profiles and/or Permission Sets`);
+    }
+  }
+
+  if (allFlows.length > 0) {
+    items.push("**Flow Activation** — Flows deploy as inactive. Decide activation for each:");
+    for (const c of allFlows) {
+      items.push(`  - [ ] \`${c.componentName}\``);
+      items.push(`        → Setup → Flows → find flow → Activate`);
+      items.push(`        → OR document as a customer post-install step if they should control activation`);
+    }
+  }
+
+  if (newPromptTpls.length > 0) {
+    items.push("**Prompt Template Access** — New prompt templates may need Permission Set access:");
+    for (const c of newPromptTpls) {
+      items.push(`  - [ ] \`${c.componentName}\` — add to relevant Permission Sets if user-facing`);
+    }
+  }
+
+  if (newTabs.length > 0) {
+    items.push("**Tab Visibility / App Navigation** — New custom tabs need to be added to Apps:");
+    for (const c of newTabs) {
+      items.push(`  - [ ] \`${c.componentName}\` → App Manager → edit relevant App → add to navigation items`);
+      items.push(`        → Also set Tab Settings to Default On in relevant Profiles`);
+    }
+  }
+
+  if (newLWC.length > 0) {
+    items.push("**Lightning Components** — If any are page/section components, place them in App Builder:");
+    for (const c of newLWC) {
+      items.push(`  - [ ] \`${c.componentName}\` → Setup → Lightning App Builder → add to relevant page(s)`);
+    }
+  }
+
+  if (newPermSets.length > 0) {
+    items.push("**New Permission Sets** — Document these for customers to assign post-install:");
+    for (const c of newPermSets) {
+      items.push(`  - [ ] \`${c.componentName}\` — add post-install note: assign to [role/user type]`);
+    }
+  }
+
+  if (modPermSets.length > 0) {
+    items.push("**Modified Permission Sets** — Already in package; updated FLS/OLS included automatically.");
+    items.push("  Verify the retrieved XML has all expected field/object access before uploading:");
+    for (const c of modPermSets) {
+      items.push(`  - [ ] Verify \`${c.componentName}\` has correct access for all new fields/objects`);
+    }
+  }
+
+  return items;
+}
+
+/** Scan commit messages for config-related keywords and return relevant commits. */
+function filterConfigCommits(commits: CommitEntry[]): CommitEntry[] {
+  const keywords = [
+    "permission", "layout", "profile", "record type", "flow", "activat",
+    "custom setting", "tab", "navigation", "app builder", "app page",
+    "dashboard", "report", "sharing", "role", "access", "fls", "crud",
+    "connected app", "auth provider", "list view",
+  ];
+  return commits.filter(c =>
+    keywords.some(kw => c.subject.toLowerCase().includes(kw))
+  );
+}
+
 function buildOneGPChecklist(
   components: ComponentChange[],
   pkgName: string,
   deployedOrg: string,
   sinceTag: string | null,
-  date: string
+  date: string,
+  commits: CommitEntry[],
+  features: FeatureEntry[]
 ): string {
   const mustAdd      = components.filter(c => c.mustManuallyAdd && c.status !== "D");
   const autoIncluded = components.filter(c => !c.mustManuallyAdd && c.status === "M");
@@ -1002,26 +1128,23 @@ function buildOneGPChecklist(
   const lines: string[] = [];
   lines.push(`# 1GP Packaging Checklist — ${pkgName}`);
   lines.push(`Generated: ${date}  |  Deployed to: \`${deployedOrg}\``);
-  lines.push(sinceTag ? `Changes since: \`${sinceTag}\`` : "Changes: all tracked files (no prior 1GP deploy tag found — first packaging run)");
+  lines.push(sinceTag ? `Changes since: \`${sinceTag}\`` : "Changes: all tracked files (no prior 1GP deploy tag — first packaging run)");
   lines.push("");
   lines.push("---");
   lines.push("");
 
-  // ── New components: must add manually ─────────────────────────────────────
+  // ── Section 1: New components to add to Package Manager ───────────────────
   if (mustAdd.length > 0) {
-    lines.push("## ⚠️  NEW Components — Must Add to Package Manager");
+    lines.push("## Step 1 — Add New Components to Package Manager");
     lines.push("");
-    lines.push("These are new since the last 1GP deploy and must be manually added.");
-    lines.push("Group them by the Setup path below, then add each one.");
+    lines.push("Navigate to each Setup path below and add the listed components.");
     lines.push("");
 
-    // Group by setupPath for cleaner navigation
     const byPath = new Map<string, ComponentChange[]>();
     for (const c of mustAdd) {
       if (!byPath.has(c.setupPath)) byPath.set(c.setupPath, []);
       byPath.get(c.setupPath)!.push(c);
     }
-
     for (const [setupPath, comps] of byPath) {
       lines.push(`### ${setupPath}`);
       lines.push("");
@@ -1031,16 +1154,82 @@ function buildOneGPChecklist(
       lines.push("");
     }
   } else {
-    lines.push("## ✅  No New Components");
+    lines.push("## Step 1 — No New Components");
     lines.push("All changed components are already in the package.");
     lines.push("");
   }
 
-  // ── Modified components: auto-included ────────────────────────────────────
-  if (autoIncluded.length > 0) {
-    lines.push("## ✅  Modified Components — Auto-Included on Next Package Upload");
+  // ── Section 2: Predicted manual configurations ────────────────────────────
+  const derivedItems  = deriveConfigItems(components);
+  const featureSetups = features.filter(f =>
+    f.setup && f.setup.toLowerCase() !== "none — automatically active after install."
+  );
+  const configCommits = filterConfigCommits(commits);
+
+  const hasConfig = derivedItems.length > 0 || featureSetups.length > 0 || configCommits.length > 0;
+
+  lines.push("## Step 2 — Manual Configurations (Predicted)");
+  lines.push("");
+  if (!hasConfig) {
+    lines.push("No manual configurations predicted from this change set.");
+    lines.push("Still recommended: check Setup Audit Trail in jfcdev for any manual changes made since last install.");
     lines.push("");
-    lines.push("Already in the package — changes will be picked up automatically when you upload.");
+  } else {
+    lines.push("Based on the components changed, features documented, and commit history:");
+    lines.push("");
+
+    if (derivedItems.length > 0) {
+      lines.push("### Derived from component changes");
+      lines.push("");
+      for (const item of derivedItems) {
+        lines.push(item);
+      }
+      lines.push("");
+    }
+
+    if (featureSetups.length > 0) {
+      lines.push("### From feature documentation (FEATURES.md — Setup required)");
+      lines.push("");
+      for (const f of featureSetups) {
+        lines.push(`#### ${f.title}  _(${f.date})_`);
+        lines.push("");
+        for (const step of f.setup.split("\n").filter(Boolean)) {
+          const normalized = step.trim().replace(/^[-*]\s*/, "");
+          lines.push(`- [ ] ${normalized}`);
+        }
+        lines.push("");
+      }
+    }
+
+    if (configCommits.length > 0) {
+      lines.push("### Commits mentioning configuration — review these");
+      lines.push("");
+      lines.push("These commits contain keywords suggesting manual setup may be needed:");
+      lines.push("");
+      for (const c of configCommits) {
+        lines.push(`- \`${c.hash}\` ${c.subject}  _(${c.date})_`);
+      }
+      lines.push("");
+    }
+  }
+
+  // ── Section 3: Setup Audit Trail reminder ─────────────────────────────────
+  lines.push("## Step 3 — Setup Audit Trail Check");
+  lines.push("");
+  lines.push("The above is predicted from source. To catch any manual Setup changes made in jfcdev");
+  lines.push("during feature validation that did NOT make it into source:");
+  lines.push("");
+  lines.push(`- [ ] In \`${deployedOrg}\` → **Setup → Security → View Setup Audit Trail**`);
+  lines.push("      Filter by date since last install. Look for: layout assignments, flow activations,");
+  lines.push("      permission changes, app config, record type assignments.");
+  lines.push("      For anything that should be in source: retrieve it and commit before next deploy.");
+  lines.push("");
+
+  // ── Section 4: Auto-included modified components ───────────────────────────
+  if (autoIncluded.length > 0) {
+    lines.push("## Auto-Included on Upload (no action needed)");
+    lines.push("");
+    lines.push("Already in the package — changes picked up automatically on next upload:");
     lines.push("");
     for (const c of autoIncluded) {
       lines.push(`- ${c.componentType}: \`${c.componentName}\``);
@@ -1048,12 +1237,11 @@ function buildOneGPChecklist(
     lines.push("");
   }
 
-  // ── Deleted components ────────────────────────────────────────────────────
+  // ── Section 5: Deleted components ─────────────────────────────────────────
   if (deleted.length > 0) {
-    lines.push("## 🗑️  Deleted Components — Review Required");
+    lines.push("## Deleted Components — Review");
     lines.push("");
-    lines.push("Removed from source. Determine if they should also be removed from the package.");
-    lines.push("Note: 1GP packages cannot remove components once included in a Released version.");
+    lines.push("Removed from source. 1GP cannot remove components once in a Released version.");
     lines.push("");
     for (const c of deleted) {
       lines.push(`- [ ] ${c.componentType}: \`${c.componentName}\``);
@@ -1061,39 +1249,14 @@ function buildOneGPChecklist(
     lines.push("");
   }
 
-  // ── Manual configuration review ───────────────────────────────────────────
-  lines.push("## 🔍  Manual Configuration Review");
-  lines.push("");
-  lines.push("Review any configurations made manually in your validation org that are NOT in source.");
-  lines.push("These are NOT captured by git diff and will NOT be in the package automatically.");
-  lines.push("For each item below, verify it is either in source (committed) or handled separately.");
-  lines.push("");
-  lines.push("### Org configurations to check");
-  lines.push("");
-  lines.push("- [ ] **Page Layout assignments to Profiles/Record Types** — Configured in Setup? Retrieve with:");
-  lines.push("      `sf project retrieve start -m Layout -o <yourOrg>` then commit");
-  lines.push("- [ ] **Permission Set field/object access** — New fields/objects need explicit permissions in");
-  lines.push("      `.permissionset-meta.xml`. Retrieve and verify.");
-  lines.push("- [ ] **Flow activation state** — Flows deployed as inactive by default. Verify activation");
-  lines.push("      status matches what you validated. Active flows must be activated post-install by customer.");
-  lines.push("- [ ] **Custom Settings default values** — Values set via Setup → Custom Settings are NOT packaged.");
-  lines.push("      Document any required values in your post-install guide.");
-  lines.push("- [ ] **Quick Action placements on Page Layouts** — Verify layout XML captures these.");
-  lines.push("- [ ] **List View visibility / sharing** — List views configured manually in org may not be in source.");
-  lines.push("- [ ] **Connected App / Auth Provider config** — Org-specific, not included in packages.");
-  lines.push("      Document for customer post-install setup.");
-  lines.push("- [ ] **Any other Setup config made in jfcdev since last install** — Walk through recent changes");
-  lines.push("      in Setup Audit Trail (Setup → Security → View Setup Audit Trail) to identify anything missed.");
-  lines.push("");
-
-  // ── Next steps ────────────────────────────────────────────────────────────
-  lines.push("## 📦  Next Steps: Upload Package Version in Setup");
+  // ── Section 6: Next steps ──────────────────────────────────────────────────
+  lines.push("## Step 4 — Upload Package Version");
   lines.push("");
   lines.push(`1. In org **\`${deployedOrg}\`** → **Setup → Package Manager**`);
-  lines.push("2. Open your package and verify all new components above are added");
-  lines.push("3. Click **Upload** to create a new package version");
-  lines.push("4. Set version number, release notes, and password (if applicable)");
-  lines.push("5. After upload completes, copy the install link and share with customers");
+  lines.push("2. Confirm all new components from Step 1 are in the package");
+  lines.push("3. Complete all configuration items from Step 2");
+  lines.push("4. Click **Upload** — set version number and release notes");
+  lines.push("5. Copy the install link and share with customers");
   lines.push("");
 
   return lines.join("\n");
@@ -1231,7 +1394,10 @@ async function actionDeployOneGP(repo: RepoEntry, allOrgs: OrgInfo[]): Promise<v
     const components = getChangedComponents(repo.path, dir.path, sinceTag);
     const pkgName   = dir.package ?? dir.path;
 
-    const checklist     = buildOneGPChecklist(components, pkgName, targetOrg, sinceTag, today);
+    const commits       = getCommitsSince(repo.path, dir.path, sinceTag);
+    const sinceDate     = sinceTag ? (() => { try { return run(`git log -1 --format=%ad --date=short ${sinceTag}`, repo.path); } catch { return undefined; } })() : undefined;
+    const features      = parseFeaturesForPackage(repo.path, dir.path, sinceDate);
+    const checklist     = buildOneGPChecklist(components, pkgName, targetOrg, sinceTag, today, commits, features);
     const checklistPath = writeOneGPChecklist(repo.path, dir.path, today, checklist);
 
     console.log(`  ✓ Checklist written → ${path.relative(repo.path, checklistPath)}`);
