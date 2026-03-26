@@ -2102,10 +2102,30 @@ async function main(): Promise<void> {
         try {
           run(`git checkout ${PACKAGING_BRANCH}`, repo.path);
           console.log(`  ✓ Switched to ${PACKAGING_BRANCH}`);
-        } catch (e: any) {
-          console.log(`  ✗ Could not switch: ${(e.message ?? "").split("\n")[0]}`);
-          const cont = await ask("  Continue on current branch anyway? (y/N) ");
-          if (cont.toLowerCase() !== "y") { rl.close(); return; }
+        } catch {
+          // Branch doesn't exist locally — check if it exists on remote or offer to create it
+          let switched = false;
+          try {
+            run(`git checkout -b ${PACKAGING_BRANCH} origin/${PACKAGING_BRANCH}`, repo.path);
+            console.log(`  ✓ Created ${PACKAGING_BRANCH} tracking origin/${PACKAGING_BRANCH}`);
+            switched = true;
+          } catch {
+            // No remote branch either — offer to create fresh
+            const createAns = await ask(`  '${PACKAGING_BRANCH}' doesn't exist. Create it from current branch? (Y/n) `);
+            if (createAns.toLowerCase() !== "n") {
+              try {
+                run(`git checkout -b ${PACKAGING_BRANCH}`, repo.path);
+                console.log(`  ✓ Created and switched to ${PACKAGING_BRANCH}`);
+                switched = true;
+              } catch (e2: any) {
+                console.log(`  ✗ Could not create branch: ${(e2.message ?? "").split("\n")[0]}`);
+              }
+            }
+          }
+          if (!switched) {
+            const cont = await ask("  Continue on current branch anyway? (y/N) ");
+            if (cont.toLowerCase() !== "y") { rl.close(); return; }
+          }
         }
       }
     }
