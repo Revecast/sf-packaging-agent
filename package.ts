@@ -843,6 +843,115 @@ function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// ─── Destructive Changes (2GP Managed component deletion) ────────────────────
+
+interface MetadataMember {
+  type: string;
+  member: string;
+}
+
+/** Map an sfdx source file path to its Salesforce metadata type + member name. */
+function filePathToMetadata(filePath: string): MetadataMember | null {
+  let m: RegExpMatchArray | null;
+
+  m = filePath.match(/classes\/([^/]+)\.cls$/);
+  if (m) return { type: "ApexClass", member: m[1] };
+
+  m = filePath.match(/triggers\/([^/]+)\.trigger$/);
+  if (m) return { type: "ApexTrigger", member: m[1] };
+
+  m = filePath.match(/objects\/([^/]+)\/fields\/([^/]+)\.field-meta\.xml$/);
+  if (m) return { type: "CustomField", member: `${m[1]}.${m[2]}` };
+
+  m = filePath.match(/objects\/([^/]+)\/validationRules\/([^/]+)\.validationRule-meta\.xml$/);
+  if (m) return { type: "ValidationRule", member: `${m[1]}.${m[2]}` };
+
+  m = filePath.match(/objects\/([^/]+)\/recordTypes\/([^/]+)\.recordType-meta\.xml$/);
+  if (m) return { type: "RecordType", member: `${m[1]}.${m[2]}` };
+
+  m = filePath.match(/objects\/([^/]+)\/\1\.object-meta\.xml$/);
+  if (m) return { type: "CustomObject", member: m[1] };
+
+  m = filePath.match(/flows\/([^/]+)\.flow-meta\.xml$/);
+  if (m) return { type: "Flow", member: m[1] };
+
+  m = filePath.match(/lwc\/([^/]+)\/\1\.(js|html|css)-meta\.xml$/);
+  if (m) return { type: "LightningComponentBundle", member: m[1] };
+  m = filePath.match(/lwc\/([^/]+)\//);
+  if (m) return { type: "LightningComponentBundle", member: m[1] };
+
+  m = filePath.match(/aura\/([^/]+)\//);
+  if (m) return { type: "AuraDefinitionBundle", member: m[1] };
+
+  m = filePath.match(/permissionsets\/([^/]+)\.permissionset-meta\.xml$/);
+  if (m) return { type: "PermissionSet", member: m[1] };
+
+  m = filePath.match(/layouts\/([^/]+)\.layout-meta\.xml$/);
+  if (m) return { type: "Layout", member: m[1] };
+
+  m = filePath.match(/staticresources\/([^/]+)\.resource-meta\.xml$/);
+  if (m) return { type: "StaticResource", member: m[1] };
+
+  m = filePath.match(/tabs\/([^/]+)\.tab-meta\.xml$/);
+  if (m) return { type: "CustomTab", member: m[1] };
+
+  m = filePath.match(/genAiPromptTemplates\/([^/]+)\.genAiPromptTemplate-meta\.xml$/);
+  if (m) return { type: "GenAiPromptTemplate", member: m[1] };
+
+  m = filePath.match(/promptTemplates\/([^/]+)\.promptTemplate-meta\.xml$/);
+  if (m) return { type: "PromptTemplate", member: m[1] };
+
+  m = filePath.match(/customMetadata\/([^/]+)\.md-meta\.xml$/);
+  if (m) return { type: "CustomMetadata", member: m[1] };
+
+  return null;
+}
+
+/** Get files deleted from a package directory since the last version tag. */
+function getDeletedComponents(repoPath: string, pkgDirPath: string, sinceTag: string | null): MetadataMember[] {
+  try {
+    const since = sinceTag ? `${sinceTag}..HEAD` : "";
+    const raw   = since
+      ? run(`git diff ${since} --diff-filter=D --name-only -- ${pkgDirPath}`, repoPath)
+      : run(`git log --diff-filter=D --name-only --pretty=format: -- ${pkgDirPath}`, repoPath);
+    if (!raw) return [];
+
+    const seen    = new Set<string>();
+    const results: MetadataMember[] = [];
+    for (const line of raw.split("\n").filter(Boolean)) {
+      const meta = filePathToMetadata(line.trim());
+      if (!meta) continue;
+      const key = `${meta.type}::${meta.member}`;
+      if (!seen.has(key)) { seen.add(key); results.push(meta); }
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+/** Generate destructiveChanges.xml content from a list of metadata members. */
+function buildDestructiveChangesXml(deletions: MetadataMember[], apiVersion: string): string {
+  // Group members by type
+  const byType = new Map<string, string[]>();
+  for (const d of deletions) {
+    if (!byType.has(d.type)) byType.set(d.type, []);
+    byType.get(d.type)!.push(d.member);
+  }
+
+  const typeBlocks = [...byType.entries()].map(([type, members]) => {
+    const memberLines = members.map(m => `        <members>${m}</members>`).join("\n");
+    return `    <types>\n${memberLines}\n        <name>${type}</name>\n    </types>`;
+  }).join("\n");
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+${typeBlocks}
+    <version>${apiVersion}</version>
+</Package>
+`;
+}
+
 // ─── 1GP Packaging ─────────────────────────────────────────────────────────
 
 interface ComponentChange {
@@ -1674,6 +1783,54 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
   // Find previous tag for release notes scoping
   const prevTag      = getLastVersionTag(repo.path, pkgDir.path);
   const hadNamespace = !!proj.namespace;
+
+  // Destructive changes — Managed packages only, and only if Salesforce has enabled the feature
+  const destructiveChangesFile = path.join(sourceDir, "destructiveChanges.xml");
+  const existingDestructive    = fs.existsSync(destructiveChangesFile);
+  let   deletedComponents: MetadataMember[] = [];
+
+  if (!isUnlocked) {
+    deletedComponents = getDeletedComponents(repo.path, pkgDir.path, prevTag);
+
+    if (deletedComponents.length > 0) {
+      console.log(`\n  ⚠️  ${deletedComponents.length} component(s) deleted from source since last version:`);
+      deletedComponents.forEach(d => console.log(`    • ${d.type}: ${d.member}`));
+      console.log();
+      console.log("  If Salesforce has enabled 2GP component deletion on your DevHub, these can be");
+      console.log("  removed from subscriber orgs by adding them to destructiveChanges.xml.");
+      const addDestructive = await ask("  Add to destructiveChanges.xml? (Y/n) ");
+      if (addDestructive.toLowerCase() !== "n") {
+        // Merge with any existing destructiveChanges.xml entries
+        const existingMembers: MetadataMember[] = [];
+        if (existingDestructive) {
+          const existing = fs.readFileSync(destructiveChangesFile, "utf8");
+          const typeMatches = [...existing.matchAll(/<types>([\s\S]*?)<\/types>/g)];
+          for (const tm of typeMatches) {
+            const typeName   = tm[1].match(/<name>([^<]+)<\/name>/)?.[1] ?? "";
+            const memberList = [...tm[1].matchAll(/<members>([^<]+)<\/members>/g)].map(mm => mm[1]);
+            for (const member of memberList) {
+              existingMembers.push({ type: typeName, member });
+            }
+          }
+        }
+        const seen = new Set(existingMembers.map(m => `${m.type}::${m.member}`));
+        const merged = [
+          ...existingMembers,
+          ...deletedComponents.filter(d => !seen.has(`${d.type}::${d.member}`)),
+        ];
+        const apiVersion = proj.sourceApiVersion ?? "65.0";
+        fs.writeFileSync(destructiveChangesFile, buildDestructiveChangesXml(merged, apiVersion), "utf8");
+        console.log(`  ✓ destructiveChanges.xml ${existingDestructive ? "updated" : "created"} in ${pkgDir.path}`);
+        console.log("  This file will be committed with the release. Remove it manually once the");
+        console.log("  deletion version is promoted and all subscribers have upgraded.");
+      }
+    } else if (existingDestructive) {
+      console.log(`\n  ℹ️  destructiveChanges.xml exists in ${pkgDir.path} — components listed there will be removed in this version.`);
+      const xmlContent = fs.readFileSync(destructiveChangesFile, "utf8");
+      const members    = [...xmlContent.matchAll(/<members>([^<]+)<\/members>/g)].map(m => m[1]);
+      members.forEach(m => console.log(`    • ${m}`));
+    }
+  }
 
   console.log();
   console.log("  " + hr());
