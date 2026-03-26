@@ -21,40 +21,24 @@ cd ~/Documents/sf-packaging-agent
 npm install
 ```
 
-### Step 3 — Edit repos.json
-
-Open `repos.json` and set the `path` for each repo to wherever you have it cloned on your machine:
-
-```json
-[
-  {
-    "name": "revecast-recruiter",
-    "path": "~/Documents/revecast-recruiter"
-  },
-  {
-    "name": "revecast-base",
-    "path": "~/Documents/revecast-base"
-  },
-  {
-    "name": "PSACore",
-    "path": "~/Documents/PSACore"
-  }
-]
-```
-
-Add or remove repos as needed. Only repos with an `sfdx-project.json` are shown.
-
-### Step 4 — Authenticate your Salesforce orgs
+### Step 3 — Authenticate your Salesforce orgs
 
 ```bash
 sf org login web --alias jaxprod    # DevHub (must have Revecast namespace registry)
 sf org login web --alias psaDev     # Any dev/sandbox orgs you test in
 ```
 
-### Step 5 — Run
+### Step 4 — Run
 
 ```bash
 cd ~/Documents/sf-packaging-agent && npx tsx package.ts
+```
+
+On first run, the agent automatically scans `~/Documents/` for any directory containing an `sfdx-project.json`. No config file to edit. The discovered repos are cached in `repos.json` (gitignored — per-machine). Delete `repos.json` to force a rescan if you clone a new repo later.
+
+**Optional:** Add a `testOrg` to your local `repos.json` to enable auto-install testing after each version create:
+```json
+{ "name": "revecast-recruiter", "path": "~/Documents/revecast-recruiter", "testOrg": "orgfarmDev" }
 ```
 
 ---

@@ -1,3 +1,7 @@
 node_modules/
 *.js
 *.d.ts
+
+# Auto-generated per-machine repo discovery cache — not committed
+# Delete this file to trigger a fresh scan of ~/Documents on next run
+repos.json

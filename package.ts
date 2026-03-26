@@ -95,6 +95,73 @@ function banner(): void {
   console.log();
 }
 
+// ─── Pre-flight Checks ────────────────────────────────────────────────────────
+
+function preflight(): boolean {
+  const checks: { label: string; pass: boolean; fix: string }[] = [];
+
+  // sf CLI installed
+  try {
+    const ver = run("sf --version");
+    checks.push({ label: `Salesforce CLI: ${ver.split("\n")[0]}`, pass: true, fix: "" });
+  } catch {
+    checks.push({ label: "Salesforce CLI: not found", pass: false, fix: "Install from https://developer.salesforce.com/tools/salesforcecli" });
+  }
+
+  // gh CLI installed (optional — used for GitHub releases)
+  try {
+    run("gh --version");
+    checks.push({ label: "GitHub CLI: installed", pass: true, fix: "" });
+  } catch {
+    checks.push({ label: "GitHub CLI: not found (optional — needed for GitHub Release creation)", pass: true, fix: "Install from https://cli.github.com if you want automatic GitHub releases" });
+  }
+
+  // At least one org authenticated
+  try {
+    const orgs = listOrgs();
+    if (orgs.length > 0) {
+      checks.push({ label: `Authenticated orgs: ${orgs.length} found`, pass: true, fix: "" });
+    } else {
+      checks.push({ label: "Authenticated orgs: none", pass: false, fix: "Run: sf org login web --alias <alias>" });
+    }
+  } catch {
+    checks.push({ label: "Authenticated orgs: could not check", pass: false, fix: "Run: sf org login web --alias <alias>" });
+  }
+
+  const failed = checks.filter(c => !c.pass);
+
+  if (checks.some(c => c.label.includes("CLI") && c.pass)) {
+    // Only print if there's something notable
+  }
+
+  if (failed.length > 0) {
+    console.log("  Pre-flight check failed:\n");
+    failed.forEach(c => {
+      console.log(`  ✗ ${c.label}`);
+      if (c.fix) console.log(`    Fix: ${c.fix}`);
+    });
+    console.log();
+    return false;
+  }
+
+  return true;
+}
+
+/** Warn if the product repo has uncommitted changes — they won't be in the package. */
+function warnUncommittedChanges(repoPath: string, pkgDirPath: string): void {
+  try {
+    const status = run(`git status --porcelain -- ${pkgDirPath}`, repoPath);
+    if (status) {
+      const lines = status.split("\n").filter(Boolean);
+      console.log();
+      console.log(`  ⚠️  Uncommitted changes in ${pkgDirPath} (${lines.length} file(s)):`);
+      lines.slice(0, 5).forEach(l => console.log(`     ${l}`));
+      if (lines.length > 5) console.log(`     ...and ${lines.length - 5} more`);
+      console.log("  These changes will NOT be included in the package unless committed first.");
+    }
+  } catch { /* non-fatal */ }
+}
+
 // ─── Org Detection ───────────────────────────────────────────────────────────
 
 function listOrgs(): OrgInfo[] {
@@ -134,12 +201,61 @@ function listOrgs(): OrgInfo[] {
 
 // ─── Repo Registry ────────────────────────────────────────────────────────────
 
+const REPOS_FILE = path.join(__dirname, "repos.json");
+
+/**
+ * Load repos from repos.json if it exists, otherwise auto-discover by scanning
+ * ~/Documents/ for directories that contain an sfdx-project.json.
+ * Discovered repos are saved back to repos.json so future runs are instant.
+ */
 function loadRepos(): RepoEntry[] {
-  const file = path.join(__dirname, "repos.json");
-  if (!fs.existsSync(file)) return [];
-  const raw: { name: string; path: string; testOrg?: string }[] =
-    JSON.parse(fs.readFileSync(file, "utf8"));
-  return raw.map(r => ({ name: r.name, path: expandHome(r.path), testOrg: r.testOrg }));
+  if (fs.existsSync(REPOS_FILE)) {
+    const raw: { name: string; path: string; testOrg?: string }[] =
+      JSON.parse(fs.readFileSync(REPOS_FILE, "utf8"));
+    return raw.map(r => ({ name: r.name, path: expandHome(r.path), testOrg: r.testOrg }));
+  }
+  return discoverAndSaveRepos();
+}
+
+function discoverRepos(): RepoEntry[] {
+  const searchRoot = expandHome("~/Documents");
+  const found: RepoEntry[] = [];
+
+  if (!fs.existsSync(searchRoot)) return found;
+
+  for (const entry of fs.readdirSync(searchRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const repoPath  = path.join(searchRoot, entry.name);
+    const sfdxFile  = path.join(repoPath, "sfdx-project.json");
+    if (!fs.existsSync(sfdxFile)) continue;
+    try {
+      const proj = JSON.parse(fs.readFileSync(sfdxFile, "utf8"));
+      if (Array.isArray(proj.packageDirectories)) {
+        found.push({ name: entry.name, path: repoPath, testOrg: "" });
+      }
+    } catch { /* skip malformed */ }
+  }
+
+  return found;
+}
+
+function saveRepos(repos: RepoEntry[]): void {
+  fs.writeFileSync(
+    REPOS_FILE,
+    JSON.stringify(repos.map(r => ({ name: r.name, path: r.path, testOrg: r.testOrg ?? "" })), null, 2) + "\n",
+    "utf8"
+  );
+}
+
+function discoverAndSaveRepos(): RepoEntry[] {
+  console.log("  Scanning ~/Documents for Salesforce repos...");
+  const repos = discoverRepos();
+  if (repos.length > 0) {
+    saveRepos(repos);
+    console.log(`  Found ${repos.length} repo(s). Saved to repos.json.`);
+    console.log("  Edit repos.json to add testOrg aliases if you want auto-install testing.\n");
+  }
+  return repos;
 }
 
 // ─── sfdx-project.json ───────────────────────────────────────────────────────
@@ -420,6 +536,89 @@ function getInstallUrls(versionId: string): { sandbox: string; production: strin
   };
 }
 
+// ─── Version Registry ─────────────────────────────────────────────────────────
+
+interface VersionRecord {
+  repo: string;
+  package: string;
+  version: string;
+  versionId: string;
+  installKey: string;
+  installUrl: string;
+  date: string;
+  promoted: boolean;
+}
+
+const REGISTRY_FILE = path.join(__dirname, "versions.json");
+
+function loadRegistry(): VersionRecord[] {
+  if (!fs.existsSync(REGISTRY_FILE)) return [];
+  try { return JSON.parse(fs.readFileSync(REGISTRY_FILE, "utf8")); } catch { return []; }
+}
+
+function saveRegistry(records: VersionRecord[]): void {
+  fs.writeFileSync(REGISTRY_FILE, JSON.stringify(records, null, 2) + "\n", "utf8");
+}
+
+function recordVersion(
+  repoName: string,
+  pkgName: string,
+  version: string,
+  versionId: string,
+  installKey: string
+): void {
+  const records = loadRegistry();
+  const urls    = getInstallUrls(versionId);
+  records.unshift({
+    repo: repoName,
+    package: pkgName,
+    version,
+    versionId,
+    installKey,
+    installUrl: urls.sandbox,
+    date: new Date().toISOString().split("T")[0],
+    promoted: false,
+  });
+  saveRegistry(records);
+}
+
+function markPromoted(versionId: string): void {
+  const records = loadRegistry();
+  const rec     = records.find(r => r.versionId === versionId);
+  if (rec) { rec.promoted = true; saveRegistry(records); }
+}
+
+async function actionShowRegistry(): Promise<void> {
+  const records = loadRegistry();
+  if (records.length === 0) {
+    console.log("\n  No versions recorded yet.");
+    return;
+  }
+
+  console.log("\n  Version registry (newest first):\n");
+  console.log("  " + hr());
+
+  // Group by package
+  const byPkg = new Map<string, VersionRecord[]>();
+  for (const r of records) {
+    const key = `${r.repo} / ${r.package}`;
+    if (!byPkg.has(key)) byPkg.set(key, []);
+    byPkg.get(key)!.push(r);
+  }
+
+  for (const [pkg, vers] of byPkg) {
+    console.log(`\n  ${pkg}`);
+    for (const v of vers) {
+      const status = v.promoted ? "Released" : "Beta";
+      console.log(`    ${v.date}  v${v.version}  [${status}]`);
+      console.log(`    ID:  ${v.versionId}`);
+      console.log(`    Key: ${v.installKey}`);
+      console.log(`    URL: ${v.installUrl}`);
+      console.log();
+    }
+  }
+}
+
 /** Find the new version alias/ID added to sfdx-project.json after version create. */
 function findNewVersionId(
   repoPath: string,
@@ -554,7 +753,8 @@ function writeReleasesFile(repoPath: string, pkgName: string, version: string, n
   return versionFile;
 }
 
-/** Update or create a ## Latest Package Versions section in the product repo's README.md. */
+/** Update or create a ## Latest Package Versions section in the product repo's README.md.
+ *  Preserves existing rows for other packages — only updates the row for pkgName. */
 function updateProductReadme(
   repoPath: string,
   pkgName: string,
@@ -565,30 +765,71 @@ function updateProductReadme(
   const readmeFile = path.join(repoPath, "README.md");
   if (!fs.existsSync(readmeFile)) return;
 
-  const content  = fs.readFileSync(readmeFile, "utf8");
-  const today    = new Date().toISOString().split("T")[0];
-  const urls     = getInstallUrls(versionId);
+  const content = fs.readFileSync(readmeFile, "utf8");
+  const today   = new Date().toISOString().split("T")[0];
+  const urls    = getInstallUrls(versionId);
+  const newRow  = `| ${pkgName} | ${version} | \`${versionId}\` | ${today} |`;
 
-  const newSection = [
-    "## Latest Package Versions",
-    "",
-    "| Package | Version | ID | Released |",
-    "|---------|---------|-----|----------|",
-    `| ${pkgName} | ${version} | \`${versionId}\` | ${today} |`,
-    "",
-    `**Install (sandbox):** \`sf package install --package ${versionId} --installation-key ${installKey} --target-org <alias>\``,
-    "",
-    `**Install URL (sandbox):** ${urls.sandbox}`,
-    "",
-  ].join("\n");
+  // Find existing section boundaries (works whether section is mid-file or at end)
+  const sectionStart = content.indexOf("\n## Latest Package Versions");
+  const altStart     = content.startsWith("## Latest Package Versions") ? 0 : -1;
+  const start        = sectionStart !== -1 ? sectionStart + 1 : altStart !== -1 ? 0 : -1;
 
-  // Replace existing section if present, otherwise append
-  const sectionRegex = /^## Latest Package Versions[\s\S]*?(?=^## |\Z)/m;
-  const updated = sectionRegex.test(content)
-    ? content.replace(sectionRegex, newSection + "\n")
-    : content.trimEnd() + "\n\n" + newSection;
+  if (start !== -1) {
+    // Section exists — extract it, update or add the row for this package
+    const afterStart  = content.slice(start);
+    const nextSection = afterStart.slice("## Latest Package Versions".length).search(/\n## /);
+    const sectionEnd  = nextSection !== -1
+      ? start + "## Latest Package Versions".length + nextSection + 1
+      : content.length;
 
-  fs.writeFileSync(readmeFile, updated, "utf8");
+    const sectionText = content.slice(start, sectionEnd);
+
+    // Check if this package already has a row
+    const rowRegex = new RegExp(`^\\| ${escapeRegex(pkgName)} \\|.*$`, "m");
+    let newSection: string;
+    if (rowRegex.test(sectionText)) {
+      newSection = sectionText.replace(rowRegex, newRow);
+    } else {
+      // Add a new row after the table header
+      newSection = sectionText.replace(
+        /(\|[-| ]+\|\n)/,
+        `$1${newRow}\n`
+      );
+    }
+
+    // Rebuild install command block — show the most recently updated package
+    const installBlock = [
+      `**Latest install (sandbox):** \`sf package install --package ${versionId} --installation-key ${installKey} --target-org <alias>\``,
+      `**Install URL (sandbox):** ${urls.sandbox}`,
+    ].join("\n");
+
+    // Replace everything after the table with updated install block
+    const tableEnd = newSection.search(/\n\n\*\*Latest install/);
+    const tableOnly = tableEnd !== -1 ? newSection.slice(0, tableEnd) : newSection.trimEnd();
+    newSection = tableOnly + "\n\n" + installBlock + "\n";
+
+    fs.writeFileSync(readmeFile, content.slice(0, start) + newSection + content.slice(sectionEnd), "utf8");
+
+  } else {
+    // Section doesn't exist — append it
+    const newSection = [
+      "## Latest Package Versions",
+      "",
+      "| Package | Version | ID | Released |",
+      "|---------|---------|-----|----------|",
+      newRow,
+      "",
+      `**Latest install (sandbox):** \`sf package install --package ${versionId} --installation-key ${installKey} --target-org <alias>\``,
+      `**Install URL (sandbox):** ${urls.sandbox}`,
+      "",
+    ].join("\n");
+    fs.writeFileSync(readmeFile, content.trimEnd() + "\n\n" + newSection, "utf8");
+  }
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
@@ -764,6 +1005,10 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
   const description = await ask("  Version description (optional): ");
 
   const sourceDir = path.join(repo.path, pkgDir.path);
+
+  // Warn about uncommitted changes — they won't be in the package
+  warnUncommittedChanges(repo.path, pkgDir.path);
+
   const preview   = previewInjection(sourceDir);
 
   console.log();
@@ -875,7 +1120,13 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
 
   if (!success) return;
 
-  // ── Post-success: release notes, README, tag, auto-install ──────────────
+  // ── Post-success: release notes, README, tag, registry, auto-install ───────
+
+  // Record in local versions.json registry
+  if (versionId) {
+    recordVersion(repo.name, pkgDir.package!, versionShort, versionId, installKey);
+    console.log(`  ✓ Recorded in versions.json`);
+  }
 
   // Tag the product repo at this version (for future release notes scoping)
   try {
@@ -931,11 +1182,15 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
   const commitAns = await ask("  Commit release files to product repo? (sfdx-project.json, RELEASES.md, README.md) (Y/n) ");
   if (commitAns.toLowerCase() !== "n") {
     try {
-      run("git add sfdx-project.json docs/RELEASES.md README.md docs/ 2>/dev/null; git add -u", repo.path);
-      run(
-        `git commit -m "chore(release): ${pkgDir.package} v${versionShort}"`,
-        repo.path
-      );
+      // Stage specific files — avoid accidentally committing other in-progress work
+      const filesToStage = [
+        "sfdx-project.json",
+        "README.md",
+        "docs/RELEASES.md",
+        releaseNotesPath ? path.relative(repo.path, releaseNotesPath) : "",
+      ].filter(Boolean);
+      run(`git add ${filesToStage.join(" ")}`, repo.path);
+      run(`git commit -m "chore(release): ${pkgDir.package} v${versionShort}"`, repo.path);
       console.log("  ✓ Committed");
     } catch (e: any) {
       console.log(`  ! Commit skipped: ${e.message}`);
@@ -972,8 +1227,38 @@ async function actionPromote(repo: RepoEntry, devHub: string): Promise<void> {
   try {
     runLive(`sf package version promote --package ${versionId} --target-dev-hub ${devHub}`, repo.path);
     const urls = getInstallUrls(versionId);
+
+    // Mark as promoted in local registry
+    markPromoted(versionId);
+
     console.log(`\n  ✓ ${alias} promoted to Released.`);
     console.log(`  Production install URL: ${urls.production}`);
+
+    // Offer to create a GitHub Release
+    try {
+      run("gh --version");  // check gh is available
+      const ghRelease = await ask("\n  Create a GitHub Release with release notes? (Y/n) ");
+      if (ghRelease.toLowerCase() !== "n") {
+        // Find release notes file for this version
+        // alias format is e.g. "revecast-recruiter@1.0.4-1" — extract package name and version
+        const aliasParts          = alias.split("@");
+        const pkgNameFromAlias    = aliasParts[0]?.trim() ?? alias;
+        const versionShortFromAlias = aliasParts[1]?.split("-")[0]?.trim() ?? alias;
+        const releaseFile = path.join(
+          repo.path, "docs",
+          `${pkgNameFromAlias.replace(/[^a-zA-Z0-9-]/g, "-")}-v${versionShortFromAlias}.md`
+        );
+        const notesArg = fs.existsSync(releaseFile) ? `--notes-file "${releaseFile}"` : `--notes "Released ${alias}"`;
+        const tagName  = `${alias.replace(/[^a-zA-Z0-9.-]/g, "-")}`;
+        try {
+          run(`git tag -f ${tagName}`, repo.path);
+          run(`git push origin ${tagName}`, repo.path);
+        } catch { /* tag/push may fail if remote not configured */ }
+        runLive(`gh release create "${tagName}" ${notesArg} --title "${alias}" --repo $(gh repo view --json nameWithOwner -q .nameWithOwner)`, repo.path);
+        console.log(`  ✓ GitHub Release created: ${tagName}`);
+      }
+    } catch { /* gh not available or not a github repo — skip silently */ }
+
   } catch (err: any) {
     console.error(`\n  ✗ Promote failed: ${err.message}`);
   }
@@ -1052,11 +1337,21 @@ async function actionListVersions(repo: RepoEntry, devHub: string): Promise<void
 async function main(): Promise<void> {
   banner();
 
-  const repos = loadRepos().filter(r => fs.existsSync(r.path));
-  if (repos.length === 0) {
-    console.log("  No repos found. Edit repos.json to add your repo paths.");
+  if (!preflight()) {
     rl.close();
     return;
+  }
+
+  let repos = loadRepos().filter(r => fs.existsSync(r.path));
+  if (repos.length === 0) {
+    console.log("  No repos found — rescanning ~/Documents...");
+    repos = discoverAndSaveRepos().filter(r => fs.existsSync(r.path));
+    if (repos.length === 0) {
+      console.log("  No Salesforce repos found in ~/Documents.");
+      console.log("  Make sure your repos are cloned there, then run again.");
+      rl.close();
+      return;
+    }
   }
 
   console.log("  Repos:");
@@ -1111,7 +1406,8 @@ async function main(): Promise<void> {
     console.log("    4. Install version in org        test in scratch or sandbox");
     console.log("    5. List all versions             betas and released in DevHub");
     console.log("    6. Manage dependencies           set install prerequisites");
-    console.log("    7. Exit");
+    console.log("    7. Version registry              all versions created, with install URLs and keys");
+    console.log("    8. Exit");
     console.log();
 
     const action = await ask("  Action: ");
@@ -1123,7 +1419,8 @@ async function main(): Promise<void> {
       else if (action === "4") await actionInstall(repo, allOrgs);
       else if (action === "5") await actionListVersions(repo, devHub);
       else if (action === "6") await actionManageDependencies(repo, repos);
-      else if (action === "7") { console.log("\n  Goodbye.\n"); break; }
+      else if (action === "7") await actionShowRegistry();
+      else if (action === "8") { console.log("\n  Goodbye.\n"); break; }
       else console.log("  Invalid selection.");
     } catch (err: any) {
       console.error(`\n  Error: ${err.message}`);
