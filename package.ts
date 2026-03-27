@@ -1020,6 +1020,70 @@ function diagnoseHistoriesError(captured: string, repoPath: string): HistoriesDi
   return { depAlias, depPackage, flexipages, fixedFiles, newerAlias };
 }
 
+/** Classify a metadata file path into a human-readable component type label. */
+function metadataType(filePath: string): string {
+  const p = filePath.toLowerCase();
+  if (p.includes("/flows/"))           return "Flow";
+  if (p.includes("/classes/"))         return "Apex Class";
+  if (p.includes("/lwc/"))             return "LWC Component";
+  if (p.includes("/aura/"))            return "Aura Component";
+  if (p.includes("/objects/") && p.includes("/fields/")) return "Custom Field";
+  if (p.includes("/objects/") && p.endsWith(".object-meta.xml")) return "Custom Object";
+  if (p.includes("/flexipages/"))      return "Flexipage";
+  if (p.includes("/layouts/"))         return "Page Layout";
+  if (p.includes("/triggers/"))        return "Apex Trigger";
+  if (p.includes("/permissionsets/"))  return "Permission Set";
+  if (p.includes("/custommetadata/"))  return "Custom Metadata Record";
+  if (p.includes("/tabs/"))            return "Tab";
+  if (p.includes("/quickactions/"))    return "Quick Action";
+  if (p.includes("/workflows/"))       return "Workflow";
+  if (p.includes("/applications/"))    return "App";
+  if (p.includes("/reports/"))         return "Report";
+  if (p.includes("/reporttypes/"))     return "Report Type";
+  if (p.includes("/staticresources/")) return "Static Resource";
+  if (p.includes("/email/"))           return "Email Template";
+  if (p.includes("/labels/"))          return "Custom Label";
+  return "Other";
+}
+
+/**
+ * Diff the package source directory against the last version tag.
+ * Returns counts of added, modified, and removed components by type.
+ */
+function summarizeChangedComponents(
+  repoPath: string,
+  pkgDirPath: string,
+  sinceTag: string | null
+): { added: Record<string, number>; modified: Record<string, number>; removed: Record<string, number> } {
+  const added: Record<string, number>    = {};
+  const modified: Record<string, number> = {};
+  const removed: Record<string, number>  = {};
+
+  if (!sinceTag) return { added, modified, removed };
+
+  try {
+    const diff = run(
+      `git diff --name-status ${sinceTag}..HEAD -- "${pkgDirPath}"`,
+      repoPath
+    );
+    for (const line of diff.split("\n").filter(Boolean)) {
+      const [status, ...parts] = line.split("\t");
+      const file = parts[parts.length - 1];
+      if (!file) continue;
+      // Skip meta-only files that don't represent meaningful content changes
+      if (file.endsWith("-meta.xml") && !file.endsWith(".object-meta.xml") &&
+          !file.endsWith(".field-meta.xml") && !file.includes("/flows/") &&
+          !file.includes("/classes/") && !file.includes("/triggers/")) continue;
+      const type = metadataType(file);
+      if (status.startsWith("A"))      added[type]    = (added[type]    ?? 0) + 1;
+      else if (status.startsWith("M")) modified[type] = (modified[type] ?? 0) + 1;
+      else if (status.startsWith("D")) removed[type]  = (removed[type]  ?? 0) + 1;
+    }
+  } catch { /* non-fatal */ }
+
+  return { added, modified, removed };
+}
+
 /** Build a full markdown release notes document for this version. */
 function buildReleaseNotes(
   repo: RepoEntry,
@@ -1045,6 +1109,9 @@ function buildReleaseNotes(
 
   // Parse feature entries from FEATURES.md
   const features = parseFeaturesForPackage(repo.path, pkgDir.path, sinceDate);
+
+  // Diff the package source to summarize added/changed/removed components
+  const componentChanges = summarizeChangedComponents(repo.path, pkgDir.path, sinceTag);
 
   const lines: string[] = [];
   lines.push(`# ${pkgDir.package} — v${version}`);
@@ -1083,28 +1150,53 @@ function buildReleaseNotes(
       }
       lines.push("");
     }
-  } else if (commits.length > 0) {
-    // No FEATURES.md entries — derive a plain summary from commit messages
-    const fixes    = commits.filter(c => /^fix|^bug/i.test(c.subject));
-    const feats    = commits.filter(c => /^feat/i.test(c.subject));
-    const others   = commits.filter(c => !/^fix|^bug|^feat/i.test(c.subject));
+  } else {
+    // No FEATURES.md entries — build summary from component diff + commits
+    const { added, modified, removed } = componentChanges;
+    const hasChanges = Object.keys(added).length + Object.keys(modified).length + Object.keys(removed).length > 0;
+
+    if (hasChanges) {
+      const formatCounts = (counts: Record<string, number>) =>
+        Object.entries(counts)
+          .sort((a, b) => b[1] - a[1])
+          .map(([type, n]) => `${n} ${type}${n !== 1 ? "s" : ""}`)
+          .join(", ");
+
+      if (Object.keys(added).length > 0) {
+        lines.push(`**New:** ${formatCounts(added)}`);
+        lines.push("");
+      }
+      if (Object.keys(modified).length > 0) {
+        lines.push(`**Updated:** ${formatCounts(modified)}`);
+        lines.push("");
+      }
+      if (Object.keys(removed).length > 0) {
+        lines.push(`**Removed:** ${formatCounts(removed)}`);
+        lines.push("");
+      }
+    }
+
+    // Supplement with commit-level detail grouped by type
+    const fixes  = commits.filter(c => /^fix|^bug/i.test(c.subject));
+    const feats  = commits.filter(c => /^feat/i.test(c.subject));
     if (feats.length > 0) {
-      lines.push("**New features:**");
+      lines.push("**Feature commits:**");
       feats.forEach(c => lines.push(`- ${c.subject.replace(/^feat(\([^)]+\))?:\s*/i, "")}`));
       lines.push("");
     }
     if (fixes.length > 0) {
-      lines.push("**Bug fixes / internal improvements:**");
+      lines.push("**Fixes:**");
       fixes.forEach(c => lines.push(`- ${c.subject.replace(/^fix(\([^)]+\))?:\s*/i, "")}`));
       lines.push("");
     }
-    if (others.length > 0 && feats.length === 0 && fixes.length === 0) {
-      others.forEach(c => lines.push(`- ${c.subject}`));
+    if (!hasChanges && feats.length === 0 && fixes.length === 0 && commits.length > 0) {
+      commits.forEach(c => lines.push(`- ${c.subject}`));
       lines.push("");
     }
-  } else {
-    lines.push("No changes recorded.");
-    lines.push("");
+    if (!hasChanges && commits.length === 0) {
+      lines.push("No changes recorded.");
+      lines.push("");
+    }
   }
 
   // Commits
