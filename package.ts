@@ -1064,10 +1064,10 @@ function buildReleaseNotes(
   lines.push(`Or use the install URL: ${urls.production}`);
   lines.push("");
 
-  // Features
+  // What's New — from FEATURES.md entries if available, otherwise summarise commits
+  lines.push("## What's New");
+  lines.push("");
   if (features.length > 0) {
-    lines.push("## What's New");
-    lines.push("");
     for (const f of features) {
       lines.push(`### ${f.title}`);
       if (f.description) lines.push(f.description);
@@ -1083,6 +1083,28 @@ function buildReleaseNotes(
       }
       lines.push("");
     }
+  } else if (commits.length > 0) {
+    // No FEATURES.md entries — derive a plain summary from commit messages
+    const fixes    = commits.filter(c => /^fix|^bug/i.test(c.subject));
+    const feats    = commits.filter(c => /^feat/i.test(c.subject));
+    const others   = commits.filter(c => !/^fix|^bug|^feat/i.test(c.subject));
+    if (feats.length > 0) {
+      lines.push("**New features:**");
+      feats.forEach(c => lines.push(`- ${c.subject.replace(/^feat(\([^)]+\))?:\s*/i, "")}`));
+      lines.push("");
+    }
+    if (fixes.length > 0) {
+      lines.push("**Bug fixes / internal improvements:**");
+      fixes.forEach(c => lines.push(`- ${c.subject.replace(/^fix(\([^)]+\))?:\s*/i, "")}`));
+      lines.push("");
+    }
+    if (others.length > 0 && feats.length === 0 && fixes.length === 0) {
+      others.forEach(c => lines.push(`- ${c.subject}`));
+      lines.push("");
+    }
+  } else {
+    lines.push("No changes recorded.");
+    lines.push("");
   }
 
   // Commits
@@ -2416,6 +2438,9 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string, forcePkgDir?
                 await actionCreateVersion(repo, devHub, depPkgDir);
                 const newDepVer = findNewVersionId(repo.path, aliasesBefore);
                 if (newDepVer && newDepVer.alias.startsWith(diagnosis.depPackage + "@")) {
+                  // Add the dep's new alias to prevAliases so findNewVersionId won't
+                  // mistake it for the outer package's version ID after the retry build.
+                  prevAliases[newDepVer.alias] = newDepVer.id;
                   console.log();
                   console.log(`  ✓ ${newDepVer.alias} built. Upgrading dependency and retrying ${pkgDir.package}...`);
                   upgradeStaleDepReferences(repo.path, pkgDir);
@@ -2550,21 +2575,18 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string, forcePkgDir?
     console.log("  Tip: add a \"testOrg\" to repos.json to enable auto-install after each version create.");
   }
 
-  // Commit all changes to the product repo
-  console.log();
-  const commitAns = await ask("  Commit release files to product repo? (sfdx-project.json, RELEASES.md, README.md) (Y/n) ");
-  if (commitAns.toLowerCase() !== "n") {
+  // Auto-commit release files to the product repo
+  if (!isNestedBuild) {
     try {
-      // Stage specific files — avoid accidentally committing other in-progress work
       const filesToStage = [
         "sfdx-project.json",
         "README.md",
         "docs/RELEASES.md",
         releaseNotesPath ? path.relative(repo.path, releaseNotesPath) : "",
       ].filter(Boolean);
-      run(`git add ${filesToStage.join(" ")}`, repo.path);
+      run(`git add ${filesToStage.map(f => `"${f}"`).join(" ")}`, repo.path);
       run(`git commit -m "chore(release): ${pkgDir.package} v${versionShort}"`, repo.path);
-      console.log("  ✓ Committed");
+      console.log("  ✓ Committed release files to repo");
     } catch (e: any) {
       console.log(`  ! Commit skipped: ${e.message}`);
     }
