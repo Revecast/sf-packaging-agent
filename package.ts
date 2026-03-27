@@ -9,7 +9,7 @@
 import * as readline from "readline";
 import * as fs from "fs";
 import * as path from "path";
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -86,6 +86,24 @@ function run(cmd: string, cwd?: string): string {
 
 function runLive(cmd: string, cwd?: string): void {
   execSync(cmd, { stdio: "inherit", cwd });
+}
+
+/** Like runLive but also captures combined output so callers can inspect it on failure. */
+function runLiveCaptured(cmd: string, cwd?: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, { shell: true, cwd, stdio: ["inherit", "pipe", "pipe"] });
+    let captured = "";
+    child.stdout.on("data", (chunk: Buffer) => { process.stdout.write(chunk); captured += chunk.toString(); });
+    child.stderr.on("data", (chunk: Buffer) => { process.stderr.write(chunk); captured += chunk.toString(); });
+    child.on("close", code => {
+      if (code === 0) { resolve(captured); }
+      else {
+        const err: any = new Error(`Command failed: ${cmd}`);
+        err.captured = captured;
+        reject(err);
+      }
+    });
+  });
 }
 
 function hr(w = 64): string { return "─".repeat(w); }
@@ -332,7 +350,7 @@ async function promptVersionBump(current: string): Promise<string> {
 function nsName(value: string): string {
   return value.replace(
     /(?<![A-Za-z0-9]__)[A-Za-z][A-Za-z0-9_]*(__c|__mdt|__e|__b)\b/g,
-    match => `${NAMESPACE}__${match}`
+    match => match.startsWith(`${NAMESPACE}__`) ? match : `${NAMESPACE}__${match}`
   );
 }
 
@@ -646,6 +664,360 @@ function findNewVersionId(
   } catch {
     return null;
   }
+}
+
+// ─── Pre-build Packaging Scanner ─────────────────────────────────────────────
+
+interface PackagingIssue {
+  severity: "error" | "warning";
+  file:     string;
+  rule:     string;
+  detail:   string;
+  fix:      string;
+}
+
+/**
+ * Known packaging rules. Each rule scans a single file's content and returns any issues found.
+ * Add new rules here as more problematic patterns are discovered.
+ */
+const PACKAGING_RULES: Array<{
+  name:  string;
+  match: (filePath: string, content: string) => Omit<PackagingIssue, "file">[];
+}> = [
+  {
+    name: "Histories related list in flexipage",
+    match(filePath, content) {
+      if (!filePath.endsWith(".flexipage-meta.xml")) return [];
+      const issues: Omit<PackagingIssue, "file">[] = [];
+      const blocks = content.match(/<componentInstances>[\s\S]*?<\/componentInstances>/g) ?? [];
+      for (const block of blocks) {
+        if (block.includes("force:relatedListSingleContainer") && block.includes("<value>Histories</value>")) {
+          issues.push({
+            severity: "error",
+            rule:     "Histories related list",
+            detail:   "Contains a Field History related list component. Fresh scratch orgs don't have history tracking pre-enabled, so this blocks dependency installation.",
+            fix:      "Remove the force:relatedListSingleContainer Histories block from this page, or enable history tracking in the scratch org def.",
+          });
+        }
+      }
+      return issues;
+    },
+  },
+  {
+    name: "Knowledge in package",
+    match(filePath, content) {
+      if (!filePath.endsWith(".object-meta.xml") && !filePath.endsWith(".field-meta.xml")) return [];
+      if (/KnowledgeArticleVersion|Knowledge__kav|<objectType>Knowledge/i.test(content)) {
+        return [{
+          severity: "error",
+          rule:     "Knowledge object",
+          detail:   "Knowledge / Lightning Knowledge cannot be included in a 2GP managed package.",
+          fix:      "Remove Knowledge components from the package directory.",
+        }];
+      }
+      return [];
+    },
+  },
+  {
+    name: "Histories related list in page layout",
+    match(filePath, content) {
+      if (!filePath.endsWith(".layout-meta.xml")) return [];
+      if (/<relatedList>.*?Histories<\/relatedList>/s.test(content) ||
+          content.includes("<relatedList>AccountHistory</relatedList>") ||
+          content.includes("<relatedList>ContactHistory</relatedList>") ||
+          content.includes("<relatedList>OpportunityHistory</relatedList>")) {
+        return [{
+          severity: "warning",
+          rule:     "Histories related list in layout",
+          detail:   "This layout includes a Field History related list. May cause install failures if history tracking isn't enabled in the target org.",
+          fix:      "Remove the Histories related list section from this layout.",
+        }];
+      }
+      return [];
+    },
+  },
+  {
+    name: "Territory Management",
+    match(filePath, content) {
+      if (/Territory2|UserTerritory2Association/i.test(content)) {
+        return [{
+          severity: "warning",
+          rule:     "Territory Management",
+          detail:   "References Territory Management (Territory2), which requires the feature to be enabled in the target org.",
+          fix:      "Add Territory2 to the scratch org def features array, or remove Territory references from the package.",
+        }];
+      }
+      return [];
+    },
+  },
+  {
+    name: "External object reference",
+    match(filePath, content) {
+      if (filePath.endsWith(".object-meta.xml") && /<externalDataSource>/i.test(content)) {
+        return [{
+          severity: "error",
+          rule:     "External object",
+          detail:   "External objects (backed by External Data Sources) cannot be included in a managed package.",
+          fix:      "Remove this object from the package directory.",
+        }];
+      }
+      return [];
+    },
+  },
+  {
+    name: "Hard-coded record type developer name",
+    match(filePath, content) {
+      if (!filePath.endsWith(".flow-meta.xml")) return [];
+      const matches = [...content.matchAll(/<stringValue>(Master)<\/stringValue>/g)];
+      if (matches.length > 0) {
+        return [{
+          severity: "warning",
+          rule:     "Hard-coded 'Master' record type",
+          detail:   `Flow references the hard-coded record type name "Master". This may fail in orgs that have renamed or removed the Master record type.`,
+          fix:      "Use a dynamic record type lookup or a custom label instead of hard-coding 'Master'.",
+        }];
+      }
+      return [];
+    },
+  },
+  {
+    name: "Standard object with enableHistory",
+    match(filePath, content) {
+      if (!filePath.endsWith(".object-meta.xml")) return [];
+      const isStandard = !path.basename(filePath).includes("__c") &&
+                         !path.basename(filePath).includes("__mdt") &&
+                         !path.basename(filePath).includes("__e");
+      if (isStandard && /<enableHistory>true<\/enableHistory>/i.test(content)) {
+        return [{
+          severity: "warning",
+          rule:     "Standard object history tracking",
+          detail:   "Enables field history tracking on a standard object. The scratch org def may need accountSettings.enableAccountHistoryTracking (for Account) or equivalent settings for other objects.",
+          fix:      "Verify the scratch org def has the appropriate settings for this object's history tracking.",
+        }];
+      }
+      return [];
+    },
+  },
+  {
+    name: "Unsupported related list in flexipage",
+    match(filePath, content) {
+      if (!filePath.endsWith(".flexipage-meta.xml")) return [];
+      const UNSUPPORTED = [
+        { value: "ActionPlans",   feature: "Action Plans" },
+        { value: "OpenActivities", feature: "Activities (Open)" },
+      ];
+      const issues: Omit<PackagingIssue, "file">[] = [];
+      for (const { value, feature } of UNSUPPORTED) {
+        if (content.includes(`<value>${value}</value>`)) {
+          issues.push({
+            severity: "error",
+            rule:     `Unsupported related list: ${value}`,
+            detail:   `Contains a force:relatedListSingleContainer for "${value}" which requires the "${feature}" feature to be enabled. Fresh scratch orgs don't have this.`,
+            fix:      `Remove the ${value} force:relatedListSingleContainer block from this flexipage.`,
+          });
+        }
+      }
+      return issues;
+    },
+  },
+  {
+    name: "Already-namespaced flow fields",
+    match(filePath, content) {
+      if (!filePath.endsWith(".flow-meta.xml")) return [];
+      // Detect flows retrieved from a namespaced org — these already have Revecast__ prefixes.
+      // The namespace injector handles them correctly, but flag as info so developers know.
+      const doubleCount = (content.match(/Revecast__Revecast__/g) ?? []).length;
+      if (doubleCount > 0) {
+        return [{
+          severity: "error",
+          rule:     "Double-namespaced fields in flow",
+          detail:   `Found ${doubleCount} occurrence(s) of "Revecast__Revecast__" — the namespace injection has already been applied to this file and was not reverted. Re-retrieve this flow from a clean (non-namespaced) org or revert the injection.`,
+          fix:      "Run: sf project retrieve start --metadata FlowDefinition:<FlowName> against a non-namespaced org, then replace the file.",
+        }];
+      }
+      return [];
+    },
+  },
+];
+
+/** Scan all files in a package source directory and return any packaging issues found. */
+function scanForPackagingIssues(sourceDir: string, repoPath: string): PackagingIssue[] {
+  const issues: PackagingIssue[] = [];
+  if (!fs.existsSync(sourceDir)) return issues;
+
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (!entry.name.endsWith(".xml")) continue;
+      let content: string;
+      try { content = fs.readFileSync(full, "utf8"); } catch { continue; }
+      for (const rule of PACKAGING_RULES) {
+        for (const issue of rule.match(full, content)) {
+          issues.push({ ...issue, file: full });
+        }
+      }
+    }
+  };
+  walk(sourceDir);
+
+  // Check for global Apex classes deleted since the last git tag (can't remove from promoted package)
+  try {
+    const deletedCls = run(
+      `git diff HEAD --diff-filter=D --name-only -- "${path.relative(repoPath, sourceDir)}/**/*.cls" 2>/dev/null || true`,
+      repoPath
+    ).trim();
+    for (const f of deletedCls.split("\n").filter(Boolean)) {
+      // Peek at the file in HEAD to see if it was global
+      try {
+        const old = run(`git show HEAD:${f}`, repoPath);
+        if (/^\s*global\s/m.test(old)) {
+          issues.push({
+            severity: "error",
+            file:     path.join(repoPath, f),
+            rule:     "Deleted global Apex class",
+            detail:   `${path.basename(f, ".cls")} was a 'global' class in a previous version. Global classes cannot be removed from a 2GP managed package.`,
+            fix:      `Restore this file with its 'global' access modifier. Run: git checkout HEAD -- ${f}`,
+          });
+        }
+      } catch { /* file may not exist in HEAD */ }
+    }
+  } catch { /* git not available or no history */ }
+
+  return issues;
+}
+
+// ─── Dependency Helpers ───────────────────────────────────────────────────────
+
+/** Compare two package alias version strings like "PSACore@0.7.0-3". Returns negative/0/positive. */
+function comparePackageAliasVersions(a: string, b: string): number {
+  const ver = (s: string) => s.replace(/^[^@]+@/, "").replace("-", ".").split(".").map(Number);
+  const av = ver(a), bv = ver(b);
+  for (let i = 0; i < Math.max(av.length, bv.length); i++) {
+    const diff = (av[i] ?? 0) - (bv[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+/** Find the latest alias for a given package name across all packageAliases. */
+function findLatestPackageAlias(aliases: Record<string, string>, packageName: string): string | null {
+  const matching = Object.keys(aliases).filter(k =>
+    k.startsWith(packageName + "@") && aliases[k].startsWith("04t")
+  );
+  if (matching.length === 0) return null;
+  return matching.sort(comparePackageAliasVersions).at(-1) ?? null;
+}
+
+/** Check if any dependency of pkgDir references an older version than the latest in packageAliases.
+ *  Returns the list of deps that were auto-upgraded. */
+function upgradeStaleDepReferences(
+  repoPath: string,
+  pkgDir: PackageDir
+): { oldAlias: string; newAlias: string }[] {
+  const proj = readProject(repoPath);
+  const aliases = proj.packageAliases ?? {};
+  const upgrades: { oldAlias: string; newAlias: string }[] = [];
+
+  const workDir = proj.packageDirectories.find(d => d.path === pkgDir.path);
+  if (!workDir?.dependencies) return [];
+
+  for (const dep of workDir.dependencies) {
+    const baseName = dep.package.includes("@") ? dep.package.split("@")[0] : dep.package;
+    const latest   = findLatestPackageAlias(aliases, baseName);
+    if (latest && latest !== dep.package) {
+      upgrades.push({ oldAlias: dep.package, newAlias: latest });
+      dep.package = latest;
+    }
+  }
+
+  if (upgrades.length > 0) {
+    writeProject(repoPath, proj);
+  }
+  return upgrades;
+}
+
+/** Remove `force:relatedListSingleContainer` component instances with relatedListApiName=Histories. */
+function removeHistoriesRelatedListFromFlexipage(content: string): string {
+  return content.replace(/<componentInstances>[\s\S]*?<\/componentInstances>/g, block => {
+    if (block.includes("force:relatedListSingleContainer") && block.includes("<value>Histories</value>")) {
+      return "";
+    }
+    return block;
+  });
+}
+
+/** Search a source directory tree for a flexipage with the given API name. */
+function findFlexipageInSource(sourceDir: string, apiName: string): string | null {
+  const candidates = [
+    path.join(sourceDir, "main", "default", "flexipages", `${apiName}.flexipage-meta.xml`),
+    path.join(sourceDir, "flexipages", `${apiName}.flexipage-meta.xml`),
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  // Fallback: recursive glob-style search
+  try {
+    const result = execSync(
+      `find "${sourceDir}" -name "${apiName}.flexipage-meta.xml" 2>/dev/null | head -1`,
+      { encoding: "utf8" }
+    ).trim();
+    return result || null;
+  } catch {
+    return null;
+  }
+}
+
+interface HistoriesDiagnosis {
+  depAlias:      string;   // e.g. "PSACore@0.7.0-3"
+  depPackage:    string;   // e.g. "PSACore"
+  flexipages:    string[]; // affected page names
+  fixedFiles:    string[]; // source files modified
+  newerAlias:    string | null; // latest available dep version, if newer
+}
+
+/** Diagnose a Histories-related-list error: parse the failing dep, fix source flexipages if present,
+ *  and check whether a newer dep version is already available. */
+function diagnoseHistoriesError(captured: string, repoPath: string): HistoriesDiagnosis | null {
+  const idMatch = captured.match(/install a package dependency, ID (04t[A-Za-z0-9]+)/);
+  if (!idMatch) return null;
+  const failingId = idMatch[1];
+
+  const proj    = readProject(repoPath);
+  const aliases = proj.packageAliases ?? {};
+
+  // Match the full 18-char ID (error may truncate to 15 chars)
+  const depAlias = Object.keys(aliases).find(k => aliases[k].startsWith(failingId.substring(0, 15)));
+  if (!depAlias) return null;
+
+  const depPackage  = depAlias.includes("@") ? depAlias.split("@")[0] : depAlias;
+  const flexipages  = [...captured.matchAll(/ID 04t[A-Za-z0-9]+:\s*([A-Za-z0-9_]+):\s*Component \[force:relatedListSingleContainer\]/g)]
+    .map(m => m[1]);
+
+  const depDir = proj.packageDirectories.find(d => d.package === depPackage);
+  const fixedFiles: string[] = [];
+
+  if (depDir) {
+    const depSrc = path.join(repoPath, depDir.path);
+    for (const fpName of flexipages) {
+      const fpPath = findFlexipageInSource(depSrc, fpName);
+      if (fpPath) {
+        const original = fs.readFileSync(fpPath, "utf8");
+        const fixed    = removeHistoriesRelatedListFromFlexipage(original);
+        if (fixed !== original) {
+          fs.writeFileSync(fpPath, fixed, "utf8");
+          fixedFiles.push(fpPath);
+        }
+      }
+    }
+  }
+
+  const newerAlias = (() => {
+    const latest = findLatestPackageAlias(aliases, depPackage);
+    return latest && latest !== depAlias ? latest : null;
+  })();
+
+  return { depAlias, depPackage, flexipages, fixedFiles, newerAlias };
 }
 
 /** Build a full markdown release notes document for this version. */
@@ -1717,7 +2089,7 @@ async function actionCreatePackage(repo: RepoEntry, devHub: string, allRepos: Re
   }
 }
 
-async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<void> {
+async function actionCreateVersion(repo: RepoEntry, devHub: string, forcePkgDir?: PackageDir): Promise<void> {
   const proj    = readProject(repo.path);
   const packaged = proj.packageDirectories.filter(d => d.package);
 
@@ -1726,21 +2098,27 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
     return;
   }
 
-  console.log();
-  if (packaged.length === 1) {
-    console.log(`  Package: ${packaged[0].package}  (${packaged[0].path})`);
-  } else {
-    console.log("  Packages:");
-    packaged.forEach((d, i) => console.log(`    ${i + 1}. ${d.package}  (${d.path})  v${d.versionNumber ?? "?"}`));
-  }
-
   let pkgDir: PackageDir;
-  if (packaged.length === 1) {
-    pkgDir = packaged[0];
+  if (forcePkgDir) {
+    pkgDir = forcePkgDir;
+    console.log();
+    console.log(`  Building dependency: ${pkgDir.package}  (${pkgDir.path})`);
   } else {
-    const idx = parseInt(await ask("\n  Which to version? ")) - 1;
-    if (idx < 0 || idx >= packaged.length) { console.log("  Cancelled."); return; }
-    pkgDir = packaged[idx];
+    console.log();
+    if (packaged.length === 1) {
+      console.log(`  Package: ${packaged[0].package}  (${packaged[0].path})`);
+    } else {
+      console.log("  Packages:");
+      packaged.forEach((d, i) => console.log(`    ${i + 1}. ${d.package}  (${d.path})  v${d.versionNumber ?? "?"}`));
+    }
+
+    if (packaged.length === 1) {
+      pkgDir = packaged[0];
+    } else {
+      const idx = parseInt(await ask("\n  Which to version? ")) - 1;
+      if (idx < 0 || idx >= packaged.length) { console.log("  Cancelled."); return; }
+      pkgDir = packaged[idx];
+    }
   }
 
   const currentVersion = pkgDir.versionNumber ?? "1.0.0.NEXT";
@@ -1847,6 +2225,44 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
   }
   console.log("  " + hr());
 
+  // Check for stale dependency references — auto-upgrade to latest available version
+  {
+    const depUpgrades = upgradeStaleDepReferences(repo.path, pkgDir);
+    if (depUpgrades.length > 0) {
+      console.log();
+      console.log("  Auto-upgraded stale dependency references:");
+      depUpgrades.forEach(u => console.log(`    ${u.oldAlias}  →  ${u.newAlias}`));
+      console.log("  (sfdx-project.json updated)");
+    }
+  }
+
+  // Pre-build scan for known packaging problems
+  {
+    const issues = scanForPackagingIssues(sourceDir, repo.path);
+    if (issues.length > 0) {
+      const errors   = issues.filter(i => i.severity === "error");
+      const warnings = issues.filter(i => i.severity === "warning");
+      console.log();
+      console.log("  " + hr());
+      console.log(`  Pre-build scan: ${errors.length} error(s), ${warnings.length} warning(s) found`);
+      for (const issue of issues) {
+        const icon  = issue.severity === "error" ? "✗" : "⚠";
+        const label = issue.severity === "error" ? "ERROR" : "WARN ";
+        console.log();
+        console.log(`  ${icon} [${label}] ${issue.rule}`);
+        console.log(`    File:   ${path.relative(repo.path, issue.file)}`);
+        console.log(`    Issue:  ${issue.detail}`);
+        console.log(`    Fix:    ${issue.fix}`);
+      }
+      console.log();
+      console.log("  " + hr());
+      if (errors.length > 0) {
+        const proceed = await ask("  Errors found — these will likely cause the build to fail. Proceed anyway? (y/N) ");
+        if (proceed.toLowerCase() !== "y") { console.log("  Cancelled."); return; }
+      }
+    }
+  }
+
   const go = await ask("\n  Proceed? (Y/n) ");
   if (go.toLowerCase() === "n") { console.log("  Cancelled."); return; }
 
@@ -1863,17 +2279,26 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
 
   // Temporarily remove packageDirectories whose paths don't exist on disk —
   // sf CLI validates all dirs even when only building one package.
-  // Write a backup first so a hard kill (Ctrl+C) can be recovered from.
+  // Outer builds write a backup file (for hard-kill recovery).
+  // Nested/dep builds keep an in-memory snapshot so they don't touch the outer backup.
+  const isNestedBuild     = !!forcePkgDir;
   const sfdxProjectFile   = path.join(repo.path, "sfdx-project.json");
   const sfdxBackupFile    = path.join(repo.path, ".sfdx-project.json.packaging-backup");
   const currentProj       = readProject(repo.path);
   const missingDirs       = currentProj.packageDirectories.filter(
     d => d.path !== pkgDir.path && !fs.existsSync(path.join(repo.path, d.path))
   );
-  let removedDirs = false;
+  let removedDirs         = false;
+  let nestedSnapshot: string | null = null; // in-memory restore point for nested builds
+
   if (missingDirs.length > 0) {
-    // Write backup before touching the file
-    fs.copyFileSync(sfdxProjectFile, sfdxBackupFile);
+    if (isNestedBuild) {
+      // Save in-memory so we don't clobber the outer build's backup file
+      nestedSnapshot = fs.readFileSync(sfdxProjectFile, "utf8");
+    } else {
+      // Outer build: write backup before touching the file (Ctrl+C recovery)
+      fs.copyFileSync(sfdxProjectFile, sfdxBackupFile);
+    }
 
     console.log(`\n  Temporarily removing ${missingDirs.length} packageDirectory entry(ies) whose source is not on this branch:`);
     missingDirs.forEach(d => console.log(`    • ${d.path} (${d.package ?? "unregistered"})`));
@@ -1882,8 +2307,8 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
     );
     writeProject(repo.path, currentProj);
     removedDirs = true;
-  } else if (fs.existsSync(sfdxBackupFile)) {
-    // Clean up any leftover backup from a previous interrupted run
+  } else if (!isNestedBuild && fs.existsSync(sfdxBackupFile)) {
+    // Outer build only: clean up leftover backup from a previous interrupted run
     fs.copyFileSync(sfdxBackupFile, sfdxProjectFile);
     fs.unlinkSync(sfdxBackupFile);
     console.log(`  ✓ Restored sfdx-project.json from backup left by previous interrupted run`);
@@ -1909,40 +2334,136 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
   let success   = false;
   let versionId = "";
 
-  try {
-    runLive(args.join(" "), repo.path);
-    success = true;
+  // Up to 2 attempts: second attempt is only triggered when a Histories error is auto-fixed
+  // by upgrading the dep reference to a newer version (which is then retried immediately).
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await runLiveCaptured(args.join(" "), repo.path);
+      success = true;
 
-    // Find the new version ID from updated sfdx-project.json
-    const newVersion_ = findNewVersionId(repo.path, prevAliases);
-    versionId         = newVersion_?.id ?? "";
+      // Find the new version ID from updated sfdx-project.json
+      const newVersion_ = findNewVersionId(repo.path, prevAliases);
+      versionId         = newVersion_?.id ?? "";
 
-    console.log();
-    console.log("  " + hr());
-    console.log(`  ✓ Package version created: ${pkgDir.package} v${versionShort}`);
-    if (versionId) {
-      console.log(`  Version ID: ${versionId}`);
-      const urls = getInstallUrls(versionId);
       console.log();
-      console.log("  Install URLs:");
-      console.log(`    Sandbox:    ${urls.sandbox}`);
-      console.log(`    Production: ${urls.production}`);
+      console.log("  " + hr());
+      console.log(`  ✓ Package version created: ${pkgDir.package} v${versionShort}`);
+      if (versionId) {
+        console.log(`  Version ID: ${versionId}`);
+        const urls = getInstallUrls(versionId);
+        console.log();
+        console.log("  Install URLs:");
+        console.log(`    Sandbox:    ${urls.sandbox}`);
+        console.log(`    Production: ${urls.production}`);
+        console.log();
+        console.log("  CLI install command:");
+        console.log(`    sf package install --package ${versionId} --installation-key ${installKey} --wait 10 --target-org <alias>`);
+      }
+      console.log("  " + hr());
+      break;
+
+    } catch (err: any) {
+      const captured: string = err.captured ?? err.message ?? "";
+
+      // Auto-detect Field History related list errors caused by a dependency package containing
+      // Lightning Record Pages with Histories components that don't exist in fresh scratch orgs.
+      if (attempt === 0 && /Could not find related list \[Histories\]/i.test(captured)) {
+        console.log();
+        console.log("  " + hr());
+        console.log("  Auto-detected: dependency package has Field History related list components.");
+
+        const diagnosis = diagnoseHistoriesError(captured, repo.path);
+
+        if (diagnosis) {
+          console.log(`  Failing dep:    ${diagnosis.depAlias}`);
+          if (diagnosis.flexipages.length > 0) {
+            console.log(`  Affected pages: ${diagnosis.flexipages.join(", ")}`);
+          }
+          console.log();
+
+          if (diagnosis.fixedFiles.length > 0) {
+            console.log("  ✓ Auto-fixed: removed Histories related list component from source:");
+            diagnosis.fixedFiles.forEach(f => console.log(`    ${path.relative(repo.path, f)}`));
+            console.log(`  These changes need to be committed and a new ${diagnosis.depPackage} version built.`);
+          } else {
+            console.log(`  These pages are no longer in the ${diagnosis.depPackage} source.`);
+            console.log(`  A fresh ${diagnosis.depPackage} build will not include them.`);
+          }
+
+          if (diagnosis.newerAlias) {
+            // A newer dep version is already available — auto-update the dep ref and retry immediately
+            console.log();
+            console.log(`  A newer version is already available: ${diagnosis.newerAlias}`);
+            console.log(`  Upgrading dependency and retrying...`);
+            console.log("  " + hr());
+            console.log();
+            const updated = upgradeStaleDepReferences(repo.path, pkgDir);
+            if (updated.length > 0) {
+              updated.forEach(u => console.log(`    Updated dep: ${u.oldAlias}  →  ${u.newAlias}`));
+            }
+            continue; // retry with the updated dep reference
+          } else {
+            // No newer dep version exists — offer to build one right now
+            const depPkgDir = readProject(repo.path).packageDirectories.find(d => d.package === diagnosis.depPackage);
+            console.log();
+
+            if (depPkgDir) {
+              console.log(`  The fix requires a new ${diagnosis.depPackage} version (without the bad pages).`);
+              const buildNow = await ask(`  Build ${diagnosis.depPackage} now and retry? [Y/n] `);
+              if (buildNow.toLowerCase() !== "n") {
+                console.log("  " + hr());
+                const aliasesBefore = { ...(readProject(repo.path).packageAliases ?? {}) };
+                await actionCreateVersion(repo, devHub, depPkgDir);
+                const newDepVer = findNewVersionId(repo.path, aliasesBefore);
+                if (newDepVer && newDepVer.alias.startsWith(diagnosis.depPackage + "@")) {
+                  console.log();
+                  console.log(`  ✓ ${newDepVer.alias} built. Upgrading dependency and retrying ${pkgDir.package}...`);
+                  upgradeStaleDepReferences(repo.path, pkgDir);
+                  continue; // retry PSA Admin Setup Wizard with the new dep
+                } else {
+                  console.log(`  ${diagnosis.depPackage} build did not complete — cannot retry automatically.`);
+                }
+              }
+            } else {
+              console.log(`  ${diagnosis.depPackage} is in a different repo. Build it there first,`);
+              console.log(`  then return here — the agent will auto-upgrade the dependency and retry.`);
+            }
+          }
+        } else {
+          console.log("  Could not parse dependency info from error. See error above for details.");
+        }
+        console.log("  " + hr());
+        break;
+      }
+
+      console.error("\n  ✗ Version creation failed:\n");
+      console.error("  " + (err.message ?? "").split("\n").join("\n  "));
       console.log();
-      console.log("  CLI install command:");
-      console.log(`    sf package install --package ${versionId} --installation-key ${installKey} --wait 10 --target-org <alias>`);
+
+      if (/Can't create patch version/i.test(captured)) {
+        console.log("  Patch versioning is not enabled for this namespace.");
+        console.log("  Salesforce requires a support case to enable it: Partner Community → Log a Case.");
+        console.log("  Until then, use Minor (e.g. 0.7.0 → 0.8.0) instead of Patch for all fixes.");
+      } else if (/Global Apex class.*can't be removed|can't be removed.*Global Apex class/i.test(captured)) {
+        const classMatch = captured.match(/Global Apex classes \[([^\]]+)\]/i);
+        const classes    = classMatch ? classMatch[1].split(/,\s*/) : [];
+        console.log("  Global Apex classes cannot be removed from a 2GP managed package once promoted.");
+        if (classes.length > 0) {
+          console.log(`  Affected: ${classes.join(", ")}`);
+        }
+        console.log("  Fix: restore these classes to source with their 'global' access modifier.");
+        console.log("  They can be empty stub implementations if the original logic was removed intentionally.");
+        console.log("  Check git history: git log --all -- 'force-app/**/<ClassName>.cls'");
+      } else {
+        console.log("  Common causes:");
+        console.log("  • No namespace registry on DevHub — Setup → Company Profile → Packages → Namespace Registries");
+        console.log("  • Apex test failures — managed packages require 75% coverage");
+        console.log("  • Metadata type not packageable in managed packages");
+        console.log("  • Already promoted a version at this major.minor — bump version and retry");
+        console.log("  • Component exists in multiple package directories");
+      }
+      break;
     }
-    console.log("  " + hr());
-
-  } catch (err: any) {
-    console.error("\n  ✗ Version creation failed:\n");
-    console.error("  " + (err.message ?? "").split("\n").join("\n  "));
-    console.log();
-    console.log("  Common causes:");
-    console.log("  • No namespace registry on DevHub — Setup → Company Profile → Packages → Namespace Registries");
-    console.log("  • Apex test failures — managed packages require 75% coverage");
-    console.log("  • Metadata type not packageable in managed packages");
-    console.log("  • Already promoted a version at this major.minor — bump version and retry");
-    console.log("  • Component exists in multiple package directories");
   }
 
   // Always revert namespace (Managed only — Unlocked has no backups/namespace)
@@ -1959,8 +2480,14 @@ async function actionCreateVersion(repo: RepoEntry, devHub: string): Promise<voi
 
   // Restore any packageDirectories that were temporarily removed
   if (removedDirs) {
-    fs.copyFileSync(sfdxBackupFile, sfdxProjectFile);
-    fs.unlinkSync(sfdxBackupFile);
+    if (nestedSnapshot !== null) {
+      // Nested build: restore from in-memory snapshot (leaves outer build's backup intact)
+      fs.writeFileSync(sfdxProjectFile, nestedSnapshot, "utf8");
+    } else {
+      // Outer build: restore from backup file
+      fs.copyFileSync(sfdxBackupFile, sfdxProjectFile);
+      fs.unlinkSync(sfdxBackupFile);
+    }
     console.log(`  ✓ Restored sfdx-project.json (${missingDirs.length} packageDirectory entry(ies) added back)`);
   }
 
